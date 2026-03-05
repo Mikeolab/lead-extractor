@@ -1,0 +1,17 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.env
+*.log
+build/
+dist/
+*.spec
+.venv
+venv
+node_modules
+*.md
+!README.md

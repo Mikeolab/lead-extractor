@@ -1,0 +1,156 @@
+/* Lead Extractor Pro - Custom Styles */
+
+/* Smooth animations */
+* {
+    transition-property: background-color, border-color, color, fill, stroke, opacity, box-shadow, transform;
+    transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+    transition-duration: 150ms;
+}
+
+/* Input focus glow */
+input:focus, select:focus {
+    box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+/* Table row hover */
+tbody tr:hover {
+    background-color: #f8fafc;
+}
+
+/* Pulse animation for loading */
+@keyframes pulse-soft {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+
+.animate-pulse-soft {
+    animation: pulse-soft 2s ease-in-out infinite;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #f1f5f9;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #94a3b8;
+}
+
+/* Email badges */
+.email-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    margin: 2px;
+    background: #eff6ff;
+    color: #2563eb;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+    word-break: break-all;
+}
+
+.email-badge:hover {
+    background: #dbeafe;
+}
+
+/* Phone badges */
+.phone-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    margin: 2px;
+    background: #f0fdf4;
+    color: #16a34a;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+/* Name badges */
+.name-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    margin: 2px;
+    background: #faf5ff;
+    color: #9333ea;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 500;
+}
+
+/* URL styling */
+.source-url {
+    color: #6b7280;
+    font-size: 12px;
+    word-break: break-all;
+    max-width: 250px;
+    display: block;
+}
+
+.source-url:hover {
+    color: #2563eb;
+    text-decoration: underline;
+}
+
+/* Toast notifications */
+.toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    padding: 12px 20px;
+    border-radius: 12px;
+    color: white;
+    font-size: 14px;
+    font-weight: 500;
+    z-index: 100;
+    transform: translateY(100px);
+    opacity: 0;
+    transition: all 0.3s ease;
+}
+
+.toast.show {
+    transform: translateY(0);
+    opacity: 1;
+}
+
+.toast.success {
+    background: #16a34a;
+}
+
+.toast.error {
+    background: #dc2626;
+}
+
+.toast.info {
+    background: #2563eb;
+}
+
+/* Tier badges */
+.tier-free {
+    background: #f3f4f6;
+    color: #4b5563;
+}
+
+.tier-pro {
+    background: #fef3c7;
+    color: #b45309;
+}
+
+.tier-enterprise {
+    background: #dbeafe;
+    color: #1d4ed8;
+}
+

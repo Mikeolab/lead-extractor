@@ -1,0 +1,11 @@
+# Render.com - one-click deploy
+# Go to dashboard.render.com → New → Blueprint → connect repo, select this file
+services:
+  - type: web
+    name: lead-extractor-pro
+    runtime: docker
+    plan: free
+    envVars:
+      - key: AUTOMATION_SERVER_URL
+        value: http://localhost:8000
+    healthCheckPath: /

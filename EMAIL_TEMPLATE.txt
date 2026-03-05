@@ -1,0 +1,49 @@
+Subject: Your Lead Extractor Pro Download & License Key
+
+Hi [CUSTOMER_NAME],
+
+Thank you for your purchase of Lead Extractor Pro!
+
+DOWNLOAD INSTRUCTIONS:
+======================
+
+1. Download the app from this link:
+   [DOWNLOAD_LINK_HERE]
+
+2. Extract the zip file (if zipped) or run LeadExtractorPro.exe directly
+
+3. Double-click LeadExtractorPro.exe to launch the app
+
+4. When prompted, enter your license key below:
+
+LICENSE KEY:
+============
+[LICENSE_KEY_HERE]
+
+ACTIVATION STEPS:
+=================
+
+1. Run LeadExtractorPro.exe
+2. You'll see an activation dialog
+3. Copy your Hardware ID (shown in the dialog)
+4. Enter the license key above
+5. Click "Activate License"
+6. You're all set! ✅
+
+SYSTEM REQUIREMENTS:
+====================
+- Windows 10 or later
+- Internet connection (for automation features)
+- No additional software required
+
+SUPPORT:
+========
+If you have any questions or need help:
+- Email: support@yourapp.com
+- Response time: Within 24 hours
+
+Thank you for choosing Lead Extractor Pro!
+
+Best regards,
+[YOUR_NAME]
+
