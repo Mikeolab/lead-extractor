@@ -7,6 +7,7 @@ from typing import Optional, Dict, Tuple
 import streamlit as st
 from app.license.machine_id import get_machine_id
 from app.license.validator import validate_license, LicenseInfo
+from app.license.session_lock import get_license_session_id, claim_license_session, touch_license_session
 from app.config import LICENSE_SECRET
 from app.users.manager import user_manager
 
@@ -26,6 +27,10 @@ def show_activation_dialog() -> bool:
         True if license activated successfully, False otherwise
     """
     st.title("🔐 License Activation Required")
+    
+    if st.session_state.get("license_error_message"):
+        st.error(st.session_state.license_error_message)
+        st.session_state.license_error_message = None  # show once
     
     st.info(
         "This software requires a valid license key to operate. "
@@ -106,6 +111,13 @@ def show_activation_dialog() -> bool:
                             )
                             return False
                     
+                    # One session per license: claim this license for this device/browser
+                    session_id = get_license_session_id()
+                    ok, err = claim_license_session(clean_license_key, session_id)
+                    if not ok:
+                        st.error(f"❌ {err}")
+                        return False
+                    
                     # Create user from license
                     user = user_manager.create_user_from_license(clean_license_key)
                     
@@ -169,6 +181,16 @@ def check_license() -> Tuple[bool, Optional[Dict]]:
         # Quick validation
         license_info = validate_license(license_key, LICENSE_SECRET)
         if license_info.valid:
+            # One session per license: must still hold the claim
+            session_id = get_license_session_id()
+            ok, err = claim_license_session(license_key, session_id)
+            if not ok:
+                st.session_state.license_valid = False
+                st.session_state.license_key = None
+                st.session_state.user = None
+                st.session_state.license_error_message = err  # show in activation dialog
+                return False, None
+            
             # Check machine ID
             current_machine_id = get_machine_id()
             from app.license.generator import decode_license_key
@@ -176,10 +198,12 @@ def check_license() -> Tuple[bool, Optional[Dict]]:
             
             if payload and payload.get("machine_id"):
                 if payload["machine_id"] == current_machine_id:
+                    touch_license_session(license_key, session_id)
                     return True, st.session_state.get("user")
             
             # If no machine_id in payload, allow (backward compatibility)
             if not payload or not payload.get("machine_id"):
+                touch_license_session(license_key, session_id)
                 return True, st.session_state.get("user")
     
     # Check database
@@ -205,11 +229,17 @@ def check_license() -> Tuple[bool, Optional[Dict]]:
     conn.close()
     
     if row:
-        license_key = row[0]
+        license_key = row[0] if not hasattr(row, "get") else row["license_key"]
         
         # Validate
         license_info = validate_license(license_key, LICENSE_SECRET)
         if license_info.valid:
+            # One session per license: claim for this device/browser
+            session_id = get_license_session_id()
+            ok, _ = claim_license_session(license_key, session_id)
+            if not ok:
+                return False, None
+            
             # Check machine ID
             current_machine_id = get_machine_id()
             from app.license.generator import decode_license_key
@@ -228,6 +258,7 @@ def check_license() -> Tuple[bool, Optional[Dict]]:
                 st.session_state.license_key = license_key
                 st.session_state.user = user
                 st.session_state.license_valid = True
+                touch_license_session(license_key, session_id)
                 return True, user
     
     return False, None

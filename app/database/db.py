@@ -116,6 +116,13 @@ def get_connection():
         CREATE INDEX IF NOT EXISTS idx_queue_status ON email_queue(status, priority DESC, scheduled_at);
         CREATE INDEX IF NOT EXISTS idx_queue_mailbox ON email_queue(mailbox_id, status);
         CREATE INDEX IF NOT EXISTS idx_queue_campaign ON email_queue(campaign_id, status);
+
+        -- One active session per license (no two places at once)
+        CREATE TABLE IF NOT EXISTS license_active_sessions (
+            license_key TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            last_seen_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
     """)
 
     conn.commit()

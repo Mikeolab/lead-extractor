@@ -228,6 +228,11 @@ def _init_tables(conn):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 expires_at TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS license_active_sessions (
+                license_key TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                last_seen_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         # Add user_id to searches/leads if missing (idempotent)
         for tbl, col in [("searches", "user_id"), ("leads", "user_id")]:
