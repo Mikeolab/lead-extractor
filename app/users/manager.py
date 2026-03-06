@@ -213,7 +213,7 @@ class UserManager:
         cursor.execute(
             """SELECT u.* FROM users u
                JOIN user_sessions s ON u.id = s.user_id
-               WHERE s.session_token = ? AND s.expires_at > ? AND u.is_active = 1""",
+               WHERE s.session_token = ? AND s.expires_at > ? AND u.is_active = TRUE""",
             (session_token, datetime.utcnow().isoformat())
         )
         row = cursor.fetchone()

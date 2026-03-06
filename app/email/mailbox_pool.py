@@ -93,7 +93,7 @@ class MailboxPool:
         # Get active mailbox with capacity remaining
         row = conn.execute(
             """SELECT * FROM mailboxes 
-               WHERE is_active = 1 
+               WHERE is_active = TRUE 
                AND sent_today < daily_limit
                ORDER BY last_used ASC, sent_today ASC
                LIMIT 1"""
@@ -152,7 +152,7 @@ class MailboxPool:
         """Deactivate a mailbox (e.g., if blocked)"""
         conn = get_connection()
         conn.execute(
-            "UPDATE mailboxes SET is_active = 0 WHERE id = ?",
+            "UPDATE mailboxes SET is_active = FALSE WHERE id = ?",
             (mailbox_id,)
         )
         conn.commit()

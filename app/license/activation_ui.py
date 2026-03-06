@@ -234,7 +234,7 @@ def check_license() -> Tuple[bool, Optional[Dict]]:
     
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT license_key FROM app_license WHERE is_active = 1 ORDER BY activated_at DESC LIMIT 1"
+        "SELECT license_key FROM app_license WHERE is_active = TRUE ORDER BY activated_at DESC LIMIT 1"
     )
     row = cursor.fetchone()
     conn.close()
