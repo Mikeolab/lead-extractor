@@ -436,7 +436,6 @@ class AutomationManager:
             
             self.browser = await self.playwright.chromium.launch(
                 headless=use_headless,
-                slow_mo=int(delay_between_actions * 1000),
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--disable-dev-shm-usage",
@@ -578,7 +577,6 @@ class AutomationManager:
                         await self.broadcast({"type": "status", "message": f"🌐 [STEP 1] Opening Google... (attempt {step1_attempt}/3)"})
                         try:
                             await self.page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
-                            await asyncio.sleep(2)
                             await self.page.wait_for_load_state("networkidle", timeout=30000)
                             if "google.com" not in self.page.url.lower():
                                 raise Exception(f"Navigation failed - URL is {self.page.url}")
@@ -599,8 +597,6 @@ class AutomationManager:
                         await self.broadcast({"type": "status", "message": "❌ [STEP 1] Could not load Google after 3 attempts. Skipping query."})
                         continue
 
-                    await asyncio.sleep(delay_between_actions)
-
                     # Accept cookies if present
                     try:
                         accept_btn = await self.page.query_selector("button:has-text('Accept'), button:has-text('I agree')")
@@ -611,27 +607,16 @@ class AutomationManager:
                     except Exception:
                         pass
 
-                    # STEP 2: Type search query
+                    # STEP 2: Enter search query (instant fill)
                     await self.broadcast({"type": "status", "message": f"⌨️ [STEP 2] Typing: \"{query}\""})
                     try:
                         search_box = await self.page.wait_for_selector('textarea[name="q"], input[name="q"]', timeout=10000)
                         if not search_box:
                             raise Exception("Search box element not found")
-                        # Human-like click and type
                         await search_box.click()
-                        await asyncio.sleep(0.5)  # Pause before typing
-                        
-                        # Type character by character for more human-like behavior
-                        await search_box.fill("")  # Clear first
-                        for char in query:
-                            await search_box.type(char, delay=50 + (hash(char) % 50))  # Random delay 50-100ms
-                        await asyncio.sleep(0.3)  # Pause after typing
-                        
-                        # Validate input
-                        input_value = await search_box.input_value()
-                        if input_value != query:
-                            raise Exception(f"Input validation failed - expected '{query}', got '{input_value}'")
-                        await self.broadcast({"type": "status", "message": "✅ [STEP 2] Query typed successfully"})
+                        await search_box.fill(query)
+                        await asyncio.sleep(0.3)
+                        await self.broadcast({"type": "status", "message": "✅ [STEP 2] Query entered successfully"})
                         screenshot = await self.take_screenshot(force=True)
                         if screenshot:
                             await self.broadcast({"type": "screenshot", "data": screenshot})
@@ -655,7 +640,6 @@ class AutomationManager:
                             await asyncio.sleep(10)  # Wait for manual solve or auto-solve
                         
                         await self.page.keyboard.press("Enter")
-                        await asyncio.sleep(1)  # Human-like pause
                         
                         # Wait for URL to change to search page
                         try:
@@ -677,7 +661,6 @@ class AutomationManager:
                             pass  # URL might not change, continue anyway
                         
                         await self.page.wait_for_load_state("networkidle", timeout=30000)
-                        await asyncio.sleep(3)  # Give results time to render
                         
                         # Check again for reCAPTCHA on results page
                         recaptcha_check = await self.page.query_selector("iframe[src*='recaptcha'], div[class*='recaptcha']")
@@ -832,189 +815,72 @@ class AutomationManager:
                                     cite_elem = await elem.query_selector("cite")
                                     display_link = await cite_elem.inner_text() if cite_elem else url.split("/")[2] if "/" in url else ""
 
-                                    # STEP 5: Since query has filetype:pdf, ALL results should be PDFs - CLICK THEM ALL
                                     pdf_count += 1
                                     await self.broadcast({
                                         "type": "status",
-                                        "message": f"  📄 [STEP 5.{pdf_count}] Processing result #{pdf_count}: {title[:50]}",
+                                        "message": f"  📄 [{pdf_count}] {title[:55]}",
                                     })
-                                    
-                                    # STEP 6: CLICK THIS RESULT IMMEDIATELY (process now!)
+
                                     try:
-                                        await self.broadcast({
-                                            "type": "status",
-                                            "message": f"  🖱️ [STEP 6.{pdf_count}] Clicking result #{pdf_count}...",
-                                        })
-                                        
-                                        # Scroll into view FIRST
-                                        await link_elem.scroll_into_view_if_needed()
-                                        await asyncio.sleep(0.5)
-                                        
-                                        # Get current URL before click
-                                        current_url_before = self.page.url
-                                        
-                                        # Click the title (most reliable)
-                                        await self.broadcast({
-                                            "type": "status",
-                                            "message": f"  🖱️ Clicking title: {title[:40]}...",
-                                        })
-                                        
+                                        # Navigate directly to URL (faster + more reliable than clicking)
+                                        await self.page.goto(url, wait_until="domcontentloaded", timeout=25000)
                                         try:
-                                            await title_elem.click(timeout=5000)
-                                            await self.broadcast({
-                                                "type": "status",
-                                                "message": f"  ✅ Clicked title element",
-                                            })
-                                        except Exception as click_err:
-                                            # Fallback to link element
-                                            await self.broadcast({
-                                                "type": "status",
-                                                "message": f"  ⚠️ Title click failed, trying link: {str(click_err)[:40]}",
-                                            })
-                                            try:
-                                                await link_elem.click(timeout=5000)
-                                                await self.broadcast({
-                                                    "type": "status",
-                                                    "message": f"  ✅ Clicked link element",
-                                                })
-                                            except Exception as link_err:
-                                                # Final fallback: use JavaScript click
-                                                await self.broadcast({
-                                                    "type": "status",
-                                                    "message": f"  ⚠️ Link click failed, using JS click: {str(link_err)[:40]}",
-                                                })
-                                                await self.page.evaluate("""
-                                                    (element) => {
-                                                        element.click();
-                                                    }
-                                                """, link_elem)
-                                                await self.broadcast({
-                                                    "type": "status",
-                                                    "message": f"  ✅ Clicked via JavaScript",
-                                                })
-                                        
-                                        await asyncio.sleep(2)  # Wait for navigation
-                                        
+                                            await self.page.wait_for_load_state("networkidle", timeout=15000)
+                                        except Exception:
+                                            pass  # page loaded enough
+
                                         screenshot = await self.take_screenshot(force=True)
                                         if screenshot:
                                             await self.broadcast({"type": "screenshot", "data": screenshot})
-                                        
-                                        # Verify navigation happened
-                                        await asyncio.sleep(1)
-                                        current_url_after = self.page.url
-                                        
-                                        if current_url_after == current_url_before:
-                                            await self.broadcast({
-                                                "type": "status",
-                                                "message": f"  ⚠️ Click did not navigate! Trying direct navigation to: {url[:60]}...",
-                                            })
-                                            # Fallback: Navigate directly to URL
-                                            try:
-                                                await self.page.goto(url, wait_until="networkidle", timeout=30000)
-                                                await self.broadcast({
-                                                    "type": "status",
-                                                    "message": f"  ✅ Navigated directly",
-                                                })
-                                            except Exception as nav_error:
-                                                await self.broadcast({
-                                                    "type": "status",
-                                                    "message": f"  ❌ Direct navigation failed: {str(nav_error)[:60]}. Skipping...",
-                                                })
-                                                # Go back to search results before continuing
-                                                try:
-                                                    await self.page.go_back()
-                                                    await self.page.wait_for_load_state("networkidle", timeout=10000)
-                                                except Exception:
-                                                    await self.page.goto(f"https://www.google.com/search?q={quote_plus(query)}", wait_until="networkidle", timeout=15000)
-                                                continue  # Skip this result
-                                        else:
-                                            await self.broadcast({
-                                                "type": "status",
-                                                "message": f"  ✅ Navigation successful! URL changed to: {current_url_after[:60]}",
-                                            })
-                                        
-                                        # Wait for page to load
-                                        try:
-                                            await self.page.wait_for_load_state("networkidle", timeout=20000)
-                                            await asyncio.sleep(2)
-                                            screenshot = await self.take_screenshot(force=True)
-                                            if screenshot:
-                                                await self.broadcast({"type": "screenshot", "data": screenshot})
-                                        except Exception:
-                                            await asyncio.sleep(3)  # Fallback wait
-                                        
-                                        # STEP 7: Extract leads from PDF/page
-                                        await self.broadcast({
-                                            "type": "status",
-                                            "message": f"  📥 [STEP 7.{pdf_count}] Extracting leads from result #{pdf_count}...",
-                                        })
-                                        
-                                        pdf_leads = await self.extract_from_pdf(
-                                            url,
-                                            title,
-                                            display_link,
-                                        )
-                                        
+
+                                        pdf_leads = await self.extract_from_pdf(url, title, display_link)
+
                                         if pdf_leads:
                                             for lead in pdf_leads:
                                                 lead["search_query"] = query
                                             query_leads.extend(pdf_leads)
                                             total_leads_extracted += len(pdf_leads)
-                                            # Broadcast real-time update after each PDF
-                                            await self.broadcast({
-                                                "type": "lead_count",
-                                                "count": total_leads_extracted,
-                                                "target": target_leads,
-                                            })
+                                            await self.broadcast({"type": "lead_count", "count": total_leads_extracted, "target": target_leads})
                                             await self.broadcast({
                                                 "type": "status",
-                                                "message": f"  ✅ [STEP 7.{pdf_count}] Extracted {len(pdf_leads)} leads | Total: {total_leads_extracted} leads",
+                                                "message": f"  ✅ [{pdf_count}] {len(pdf_leads)} leads extracted | Total: {total_leads_extracted}",
                                             })
-                                            
-                                            # Check if target reached after each PDF
+
                                             if target_leads > 0 and total_leads_extracted >= target_leads:
                                                 await self.broadcast({
                                                     "type": "status",
-                                                    "message": f"🎯 Target reached! Extracted {total_leads_extracted} leads (target: {target_leads}). Stopping...",
+                                                    "message": f"🎯 Target reached! {total_leads_extracted} leads. Stopping...",
                                                 })
                                                 self.stop_flag = True
-                                                # Break out of result loop
                                                 break
                                         else:
                                             await self.broadcast({
                                                 "type": "status",
-                                                "message": f"  ⚠️ [STEP 7.{pdf_count}] No leads extracted",
+                                                "message": f"  ⚠️ [{pdf_count}] No leads on this page",
                                             })
-                                        
-                                        # STEP 8: Go back to search results
-                                        await self.broadcast({
-                                            "type": "status",
-                                            "message": f"  ⬅️ [STEP 8.{pdf_count}] Returning to search results...",
-                                        })
+
+                                        # Return to Google results
+                                        await self.page.goto(
+                                            f"https://www.google.com/search?q={quote_plus(query)}&start={(page_num - 1) * 10}",
+                                            wait_until="domcontentloaded", timeout=20000,
+                                        )
                                         try:
-                                            await self.page.go_back()
-                                            await self.page.wait_for_load_state("networkidle", timeout=15000)
-                                            await asyncio.sleep(1)
-                                            screenshot = await self.take_screenshot(force=True)
-                                            if screenshot:
-                                                await self.broadcast({"type": "screenshot", "data": screenshot})
-                                        except Exception:
-                                            # If back fails, navigate to Google search again
-                                            await self.page.goto(f"https://www.google.com/search?q={quote_plus(query)}", wait_until="networkidle", timeout=15000)
-                                        
-                                    except Exception as e:
-                                        import traceback
-                                        error_trace = traceback.format_exc()
-                                        await self.broadcast({
-                                            "type": "status",
-                                            "message": f"  ❌ Result #{pdf_count} error: {str(e)[:80]}",
-                                        })
-                                        # Try to get back to search results
-                                        try:
-                                            await self.page.go_back()
                                             await self.page.wait_for_load_state("networkidle", timeout=10000)
                                         except Exception:
-                                            await self.page.goto(f"https://www.google.com/search?q={quote_plus(query)}", wait_until="networkidle", timeout=15000)
+                                            pass
+
+                                    except Exception as e:
+                                        await self.broadcast({
+                                            "type": "status",
+                                            "message": f"  ❌ [{pdf_count}] Error: {str(e)[:80]}",
+                                        })
+                                        try:
+                                            await self.page.goto(
+                                                f"https://www.google.com/search?q={quote_plus(query)}&start={(page_num - 1) * 10}",
+                                                wait_until="domcontentloaded", timeout=15000,
+                                            )
+                                        except Exception:
+                                            pass
 
                                 except Exception:
                                     continue
