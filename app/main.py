@@ -11,6 +11,7 @@ import threading
 import time
 import websocket
 from typing import List
+from streamlit_autorefresh import st_autorefresh
 
 from app.config import APP_NAME, APP_VERSION, LICENSE_KEY, LICENSE_SECRET, EXPORT_DIR, WEBSOCKET_URL, AUTOMATION_SERVER_URL
 from app.license.validator import validate_license
@@ -597,10 +598,9 @@ def render_extractor_page():
             )
             thread.start()
 
-    # ── Auto-refresh when running ────────────────────────────────────────────
+    # ── Auto-refresh when running (smooth, no flicker) ─────────────────────
     if st.session_state.is_running:
-        time.sleep(1.5)
-        st.rerun()
+        st_autorefresh(interval=2000, limit=None, key="live_autorefresh")
 
     # ── Saved Files Display ─────────────────────────────────────────────────
     if st.session_state.saved_files:

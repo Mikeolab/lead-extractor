@@ -20,6 +20,7 @@ from playwright.async_api import async_playwright, Page, Browser
 from urllib.parse import quote_plus
 import pdfplumber
 import httpx
+from app.search.ddg_search import ddg_search as _ddg_search
 
 
 def is_rdp_session() -> bool:
@@ -304,6 +305,108 @@ class AutomationManager:
 
         return leads
 
+    async def _cloud_search_query(
+        self,
+        query: str,
+        max_pages: int,
+        delay_between_pages: float,
+        target_leads: int,
+        total_leads_extracted: int,
+    ) -> tuple:
+        """Cloud path: use DuckDuckGo HTTP search to get URLs, then visit each
+        with Playwright for lead extraction.  Returns (query_leads, new_lead_count)."""
+        query_leads = []
+        new_lead_count = 0
+
+        await self.broadcast({
+            "type": "status",
+            "message": "🌐 [CLOUD] Using DuckDuckGo search (avoids Google CAPTCHA on server IPs)",
+        })
+
+        loop = asyncio.get_running_loop()
+        ddg_result = await loop.run_in_executor(
+            None,
+            lambda: _ddg_search(
+                query,
+                num_results=max_pages * 10,
+                mode="general",
+                max_pages=max_pages,
+                delay_between_pages=delay_between_pages,
+            ),
+        )
+
+        if ddg_result.error:
+            await self.broadcast({
+                "type": "status",
+                "message": f"⚠️ [CLOUD] DDG search error: {ddg_result.error}",
+            })
+            return query_leads, new_lead_count
+
+        urls = [(r.url, r.title, r.display_link) for r in ddg_result.results]
+        await self.broadcast({
+            "type": "status",
+            "message": f"✅ [CLOUD] DuckDuckGo returned {len(urls)} results from {ddg_result.pages_fetched} page(s)",
+        })
+
+        processed = 0
+        for url, title, display_link in urls:
+            if self.stop_flag:
+                break
+            if target_leads > 0 and (total_leads_extracted + new_lead_count) >= target_leads:
+                await self.broadcast({
+                    "type": "status",
+                    "message": f"🎯 Target reached! {total_leads_extracted + new_lead_count} leads. Stopping...",
+                })
+                self.stop_flag = True
+                break
+
+            processed += 1
+            await self.broadcast({
+                "type": "status",
+                "message": f"  📄 [{processed}/{len(urls)}] Visiting: {title[:50]}",
+            })
+
+            try:
+                await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    await self.page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    await asyncio.sleep(3)
+
+                screenshot = await self.take_screenshot(force=True)
+                if screenshot:
+                    await self.broadcast({"type": "screenshot", "data": screenshot})
+
+                pdf_leads = await self.extract_from_pdf(url, title, display_link)
+                if pdf_leads:
+                    for lead in pdf_leads:
+                        lead["search_query"] = query
+                    query_leads.extend(pdf_leads)
+                    new_lead_count += len(pdf_leads)
+                    await self.broadcast({
+                        "type": "lead_count",
+                        "count": total_leads_extracted + new_lead_count,
+                        "target": target_leads,
+                    })
+                    await self.broadcast({
+                        "type": "status",
+                        "message": f"  ✅ [{processed}] Extracted {len(pdf_leads)} leads | Total: {total_leads_extracted + new_lead_count}",
+                    })
+                else:
+                    await self.broadcast({
+                        "type": "status",
+                        "message": f"  ⚠️ [{processed}] No leads on this page",
+                    })
+
+                await asyncio.sleep(delay_between_pages)
+            except Exception as e:
+                await self.broadcast({
+                    "type": "status",
+                    "message": f"  ❌ [{processed}] Error: {str(e)[:80]}",
+                })
+
+        return query_leads, new_lead_count
+
     async def run_automation(
         self,
         queries: List[str],
@@ -442,6 +545,31 @@ class AutomationManager:
 
                     query_leads = []
 
+                    # ── Cloud mode: DuckDuckGo HTTP search ──────────────────
+                    if use_headless:
+                        query_leads, cloud_count = await self._cloud_search_query(
+                            query, max_pages, delay_between_pages,
+                            target_leads, total_leads_extracted,
+                        )
+                        total_leads_extracted += cloud_count
+
+                        if query_leads:
+                            all_leads.extend(query_leads)
+                            self.all_leads_buffer.extend(query_leads)
+                            await self.broadcast({"type": "lead_count", "count": total_leads_extracted, "target": target_leads})
+                            try:
+                                saved_count = save_leads(search_id, query_leads)
+                                await self.broadcast({"type": "status", "message": f"💾 Saved {saved_count} leads to database (session #{search_id})"})
+                            except Exception as e:
+                                await self.broadcast({"type": "status", "message": f"⚠️ DB save error: {str(e)[:60]}"})
+                            await self.broadcast({"type": "leads", "data": query_leads})
+                            await self.broadcast({"type": "status", "message": f"✅ Query {query_idx + 1}: {len(query_leads)} leads | Total: {total_leads_extracted}"})
+                        else:
+                            await self.broadcast({"type": "status", "message": f"⚠️ Query {query_idx + 1}: No leads extracted"})
+                        await self.broadcast({"type": "status", "message": ""})
+                        continue  # Skip Google path below
+
+                    # ── Desktop mode: Google Playwright search ──────────────
                     # STEP 1: Navigate to Google (retry up to 3 times so first page does not quit the run)
                     step1_ok = False
                     for step1_attempt in range(1, 4):
