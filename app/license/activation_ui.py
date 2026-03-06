@@ -9,6 +9,7 @@ from app.license.machine_id import get_machine_id
 from app.license.validator import validate_license, LicenseInfo
 from app.license.session_lock import get_license_session_id, claim_license_session, touch_license_session
 from app.config import LICENSE_SECRET
+from app.database.db import using_postgres
 from app.users.manager import user_manager
 
 # Try to import pyperclip, fallback if not available
@@ -130,20 +131,29 @@ def show_activation_dialog() -> bool:
                         # Store in database
                         from app.database.db import get_connection
                         conn = get_connection()
-                        conn.execute(
-                            """CREATE TABLE IF NOT EXISTS app_license (
-                                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                license_key TEXT UNIQUE,
-                                machine_id TEXT,
-                                activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                is_active BOOLEAN DEFAULT 1
-                            )"""
-                        )
-                        conn.execute(
-                            """INSERT OR REPLACE INTO app_license (license_key, machine_id, is_active)
-                               VALUES (?, ?, 1)""",
-                            (clean_license_key, current_machine_id)
-                        )
+                        if not using_postgres():
+                            conn.execute(
+                                """CREATE TABLE IF NOT EXISTS app_license (
+                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                    license_key TEXT UNIQUE,
+                                    machine_id TEXT,
+                                    activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                    is_active BOOLEAN DEFAULT 1
+                                )"""
+                            )
+                        if using_postgres():
+                            conn.execute(
+                                """INSERT INTO app_license (license_key, machine_id, is_active)
+                                   VALUES (?, ?, TRUE)
+                                   ON CONFLICT (license_key) DO UPDATE SET machine_id = excluded.machine_id, is_active = TRUE""",
+                                (clean_license_key, current_machine_id)
+                            )
+                        else:
+                            conn.execute(
+                                """INSERT OR REPLACE INTO app_license (license_key, machine_id, is_active)
+                                   VALUES (?, ?, 1)""",
+                                (clean_license_key, current_machine_id)
+                            )
                         conn.commit()
                         conn.close()
                         
@@ -210,16 +220,17 @@ def check_license() -> Tuple[bool, Optional[Dict]]:
     from app.database.db import get_connection
     conn = get_connection()
     
-    # Ensure table exists
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS app_license (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT UNIQUE,
-            machine_id TEXT,
-            activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            is_active BOOLEAN DEFAULT 1
-        )
-    """)
+    if not using_postgres():
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_license (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                license_key TEXT UNIQUE,
+                machine_id TEXT,
+                activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT 1
+            )
+        """)
+        conn.commit()
     
     cursor = conn.cursor()
     cursor.execute(

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List
 from pathlib import Path
 
-from app.database.db import get_connection
+from app.database.db import get_connection, using_postgres
 from app.license.validator import validate_license, LicenseInfo
 from app.license.machine_id import get_machine_id
 from app.config import LICENSE_SECRET
@@ -23,49 +23,52 @@ class UserManager:
         self._ensure_tables()
     
     def _ensure_tables(self):
-        """Ensure user tables exist"""
+        """Ensure user tables exist (SQLite or PostgreSQL compatible)."""
         conn = get_connection()
-        
-        # Users table
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                email TEXT,
-                license_key TEXT,
-                machine_id TEXT,
-                plan TEXT DEFAULT 'free',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_login TIMESTAMP,
-                is_active BOOLEAN DEFAULT 1
-            )
-        """)
-        
-        # User sessions table
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                session_token TEXT UNIQUE,
-                machine_id TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users(id)
-            )
-        """)
-        
-        # Add user_id to searches if not exists
-        try:
-            conn.execute("ALTER TABLE searches ADD COLUMN user_id INTEGER")
-        except Exception:
-            pass  # Column already exists
-        
-        # Add user_id to leads if not exists
-        try:
-            conn.execute("ALTER TABLE leads ADD COLUMN user_id INTEGER")
-        except Exception:
-            pass  # Column already exists
-        
+        if using_postgres():
+            # Tables already created by db_postgres._init_tables(); only add columns if missing
+            try:
+                conn.execute("ALTER TABLE searches ADD COLUMN IF NOT EXISTS user_id INTEGER")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE leads ADD COLUMN IF NOT EXISTS user_id INTEGER")
+            except Exception:
+                pass
+        else:
+            # SQLite
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    email TEXT,
+                    license_key TEXT,
+                    machine_id TEXT,
+                    plan TEXT DEFAULT 'free',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_login TIMESTAMP,
+                    is_active BOOLEAN DEFAULT 1
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    session_token TEXT UNIQUE,
+                    machine_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                )
+            """)
+            try:
+                conn.execute("ALTER TABLE searches ADD COLUMN user_id INTEGER")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE leads ADD COLUMN user_id INTEGER")
+            except Exception:
+                pass
         conn.commit()
         conn.close()
     

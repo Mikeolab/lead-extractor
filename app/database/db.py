@@ -12,6 +12,12 @@ from app.config import DATABASE_PATH
 # When DATABASE_URL is set (e.g. on Render + Neon), use PostgreSQL
 _use_postgres = bool(os.environ.get("DATABASE_URL"))
 
+
+def using_postgres() -> bool:
+    """True when app is using PostgreSQL (e.g. Neon); use for DDL/compatibility."""
+    return _use_postgres
+
+
 if _use_postgres:
     from app.database import db_postgres as _db
 else:
