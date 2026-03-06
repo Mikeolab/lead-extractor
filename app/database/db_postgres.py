@@ -47,6 +47,9 @@ class _CursorAdapter:
             self._cur.execute(sql, params)
         else:
             self._cur.execute(sql)
+        # Refresh column order so fetchone/fetchall return correct rows
+        if self._cur.description:
+            self._col_order = [d[0] for d in self._cur.description]
         # Capture last inserted id for INSERT
         if sql.strip().upper().startswith("INSERT") and "RETURNING" not in sql.upper():
             try:
@@ -243,6 +246,8 @@ def _init_tables(conn):
                 cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} INTEGER")
             except psycopg2.ProgrammingError:
                 pass  # Column exists
+        # Clear stale session locks on startup so users aren't locked out after redeploys
+        cur.execute("DELETE FROM license_active_sessions")
     conn.commit()
 
 
