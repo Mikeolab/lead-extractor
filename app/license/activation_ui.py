@@ -38,40 +38,38 @@ def show_activation_dialog() -> bool:
         "Please follow the steps below to activate your license."
     )
     
-    # Step 1: Show Hardware ID
-    st.subheader("Step 1: Get Your Hardware ID")
-    st.write("Copy your Hardware ID and send it to the administrator to receive your license key.")
+    # Step 1: Show Hardware ID (desktop only — on web the ID is the server, not the user)
+    if not using_postgres():
+        st.subheader("Step 1: Get Your Hardware ID")
+        st.write("Copy your Hardware ID and send it to the administrator to receive your license key.")
+        
+        machine_id = get_machine_id()
+        formatted_machine_id = f"{machine_id[:4]}-{machine_id[4:8]}-{machine_id[8:12]}-{machine_id[12:16]}"
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            hardware_id_input = st.text_input(
+                "Your Hardware ID:",
+                value=formatted_machine_id,
+                disabled=True,
+                key="hardware_id_display"
+            )
+        with col2:
+            if st.button("📋 Copy", key="copy_hardware_id"):
+                if HAS_PYPERCLIP:
+                    try:
+                        pyperclip.copy(machine_id)
+                        st.success("✅ Hardware ID copied to clipboard!")
+                    except Exception:
+                        st.error("❌ Could not copy to clipboard. Please copy manually.")
+                else:
+                    st.text_area("Copy this:", machine_id, key="hardware_id_copy", height=50)
+                    st.info("Please copy the Hardware ID above manually")
+        
+        st.divider()
     
-    machine_id = get_machine_id()
-    
-    # Format machine ID for display (add dashes for readability)
-    formatted_machine_id = f"{machine_id[:4]}-{machine_id[4:8]}-{machine_id[8:12]}-{machine_id[12:16]}"
-    
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        hardware_id_input = st.text_input(
-            "Your Hardware ID:",
-            value=formatted_machine_id,
-            disabled=True,
-            key="hardware_id_display"
-        )
-    with col2:
-        if st.button("📋 Copy", key="copy_hardware_id"):
-            if HAS_PYPERCLIP:
-                try:
-                    pyperclip.copy(machine_id)  # Copy raw ID (no dashes)
-                    st.success("✅ Hardware ID copied to clipboard!")
-                except Exception:
-                    st.error("❌ Could not copy to clipboard. Please copy manually.")
-            else:
-                # Fallback: show in text area for manual copy
-                st.text_area("Copy this:", machine_id, key="hardware_id_copy", height=50)
-                st.info("Please copy the Hardware ID above manually")
-    
-    st.divider()
-    
-    # Step 2: Enter License Key
-    st.subheader("Step 2: Enter Your License Key")
+    # Enter License Key
+    st.subheader("Enter Your License Key")
     st.write("Enter the license key you received via email to activate the software.")
     
     license_key = st.text_input(
@@ -97,20 +95,20 @@ def show_activation_dialog() -> bool:
                 if not license_info.valid:
                     st.error(f"❌ Invalid license key: {license_info.error}")
                 else:
-                    # Check machine ID
-                    current_machine_id = get_machine_id()
-                    # Note: Machine ID check will be added when we update the generator
-                    # For now, we'll check if machine_id is in the payload
-                    from app.license.generator import decode_license_key
-                    payload = decode_license_key(clean_license_key)
-                    
-                    if payload and payload.get("machine_id"):
-                        if payload["machine_id"] != current_machine_id:
-                            st.error(
-                                "❌ License not valid for this computer. "
-                                "This license is bound to a different machine."
-                            )
-                            return False
+                    # Check machine ID (skip on web/server — machine_id is the container, not the user)
+                    if not using_postgres():
+                        current_machine_id = get_machine_id()
+                        from app.license.generator import decode_license_key
+                        payload = decode_license_key(clean_license_key)
+                        if payload and payload.get("machine_id"):
+                            if payload["machine_id"] != current_machine_id:
+                                st.error(
+                                    "❌ License not valid for this computer. "
+                                    "This license is bound to a different machine."
+                                )
+                                return False
+                    else:
+                        current_machine_id = "web"
                     
                     # One session per license: claim this license for this device/browser
                     session_id = get_license_session_id()
@@ -201,7 +199,12 @@ def check_license() -> Tuple[bool, Optional[Dict]]:
                 st.session_state.license_error_message = err  # show in activation dialog
                 return False, None
             
-            # Check machine ID
+            # On web (PostgreSQL), skip machine_id check — it's the server, not the user
+            if using_postgres():
+                touch_license_session(license_key, session_id)
+                return True, st.session_state.get("user")
+            
+            # Desktop: check machine ID
             current_machine_id = get_machine_id()
             from app.license.generator import decode_license_key
             payload = decode_license_key(license_key)
@@ -211,7 +214,6 @@ def check_license() -> Tuple[bool, Optional[Dict]]:
                     touch_license_session(license_key, session_id)
                     return True, st.session_state.get("user")
             
-            # If no machine_id in payload, allow (backward compatibility)
             if not payload or not payload.get("machine_id"):
                 touch_license_session(license_key, session_id)
                 return True, st.session_state.get("user")
@@ -251,14 +253,14 @@ def check_license() -> Tuple[bool, Optional[Dict]]:
             if not ok:
                 return False, None
             
-            # Check machine ID
-            current_machine_id = get_machine_id()
-            from app.license.generator import decode_license_key
-            payload = decode_license_key(license_key)
-            
-            if payload and payload.get("machine_id"):
-                if payload["machine_id"] != current_machine_id:
-                    return False, None
+            # On web, skip machine_id check
+            if not using_postgres():
+                current_machine_id = get_machine_id()
+                from app.license.generator import decode_license_key
+                payload = decode_license_key(license_key)
+                if payload and payload.get("machine_id"):
+                    if payload["machine_id"] != current_machine_id:
+                        return False, None
             
             # Get or create user
             user = user_manager.get_user_by_license(license_key)

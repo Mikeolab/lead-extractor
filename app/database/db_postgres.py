@@ -114,6 +114,9 @@ class _ConnectionAdapter:
         self._conn.close()
 
 
+_tables_initialized = False
+
+
 def _get_raw_conn():
     return psycopg2.connect(os.environ["DATABASE_URL"])
 
@@ -243,16 +246,29 @@ def _init_tables(conn):
     conn.commit()
 
 
+def _ensure_tables_once():
+    """Run DDL exactly once per process to avoid deadlocks."""
+    global _tables_initialized
+    if _tables_initialized:
+        return
+    conn = _get_raw_conn()
+    try:
+        _init_tables(conn)
+        _tables_initialized = True
+    finally:
+        conn.close()
+
+
 def get_connection():
     """Get connection - returns adapter for SQLite-compatible API."""
+    _ensure_tables_once()
     conn = _get_raw_conn()
-    _init_tables(conn)
     return _ConnectionAdapter(conn)
 
 
 def save_search(query: str, num_results: int = 0) -> int:
+    _ensure_tables_once()
     conn = _get_conn()
-    _init_tables(conn)
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO searches (query, num_results) VALUES (%s, %s) RETURNING id",
