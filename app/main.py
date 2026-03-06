@@ -127,6 +127,27 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+# ─── Thread-safe shared data (background thread writes here, main thread reads) ─
+import threading
+
+if "ws_data" not in st.session_state:
+    st.session_state.ws_data = {
+        "activity_log": [],
+        "extracted_leads": [],
+        "current_screenshot": None,
+        "is_running": False,
+        "needs_refresh": False,
+        "current_lead_count": 0,
+        "target_lead_count": 0,
+        "saved_files": [],
+        "last_update": 0,
+    }
+    st.session_state.ws_lock = threading.Lock()
+
+# Convenience ref
+_ws = st.session_state.ws_data
+_ws_lock = st.session_state.ws_lock
+
 # ─── Session State ───────────────────────────────────────────────────────────
 if "activity_log" not in st.session_state:
     st.session_state.activity_log = []
@@ -159,106 +180,94 @@ if "current_page" not in st.session_state:
 # ─── WebSocket Client (URL from app.config, supports local + cloud) ───────────
 
 
-def websocket_client(queries: List[str], max_pages: int, delay_pages: float, delay_actions: float):
-    """Connect to WebSocket server and handle messages (synchronous)."""
+def websocket_client(queries: List[str], max_pages: int, delay_pages: float, delay_actions: float,
+                     ws_data: dict, ws_lock: threading.Lock, target_leads: int = 0):
+    """Connect to WebSocket server and handle messages (runs in background thread).
+    Writes to ws_data dict (NOT st.session_state) to avoid ScriptRunContext errors.
+    """
+    _last_screenshot_time = [0.0]
+
     def on_message(ws, message):
         try:
             data = json.loads(message)
             msg_type = data.get("type")
 
-            if msg_type == "status":
-                message_text = data.get("message", "")
-                st.session_state.activity_log.append(message_text)
-                if len(st.session_state.activity_log) > 200:
-                    st.session_state.activity_log = st.session_state.activity_log[-200:]
+            with ws_lock:
+                if msg_type == "status":
+                    ws_data["activity_log"].append(data.get("message", ""))
+                    if len(ws_data["activity_log"]) > 200:
+                        ws_data["activity_log"] = ws_data["activity_log"][-200:]
+                    ws_data["needs_refresh"] = True
 
-            elif msg_type == "screenshot":
-                screenshot_data = data.get("data", "")
-                if screenshot_data:
-                    # Throttle screenshot updates (max 1 per second)
-                    current_time = time.time()
-                    if not hasattr(st.session_state, 'last_screenshot_update'):
-                        st.session_state.last_screenshot_update = 0
-                    
-                    if (current_time - st.session_state.last_screenshot_update) >= 1.0:
-                        st.session_state.current_screenshot = screenshot_data
-                        st.session_state.last_screenshot_update = current_time
-                        st.session_state.needs_refresh = True
-                        st.session_state.last_update = current_time
+                elif msg_type == "screenshot":
+                    screenshot_data = data.get("data", "")
+                    if screenshot_data:
+                        now = time.time()
+                        if (now - _last_screenshot_time[0]) >= 1.0:
+                            ws_data["current_screenshot"] = screenshot_data
+                            _last_screenshot_time[0] = now
+                            ws_data["needs_refresh"] = True
 
-            elif msg_type == "ping":
-                # Ignore ping messages (keep-alive)
-                pass
-
-            elif msg_type == "leads":
-                leads_data = data.get("data", [])
-                st.session_state.extracted_leads.extend(leads_data)
-                st.session_state.current_lead_count = len(st.session_state.extracted_leads)
-                st.session_state.needs_refresh = True
-                st.session_state.last_update = time.time()
-
-            elif msg_type == "lead_count":
-                # Real-time lead count update
-                count = data.get("count", 0)
-                target = data.get("target", 0)
-                st.session_state.current_lead_count = count
-                st.session_state.target_lead_count = target
-                st.session_state.needs_refresh = True
-                st.session_state.last_update = time.time()
-
-            elif msg_type == "file_saved":
-                file_info = {
-                    "path": data.get("path", ""),
-                    "query": data.get("query", ""),
-                    "count": data.get("count", 0),
-                    "timestamp": datetime.now().strftime("%H:%M:%S"),
-                }
-                st.session_state.saved_files.append(file_info)
-                st.session_state.activity_log.append(f"💾 File saved: {file_info['path']} ({file_info['count']} leads)")
-
-            elif msg_type == "complete":
-                all_leads = data.get("data", [])
-                if all_leads:
-                    st.session_state.extracted_leads = all_leads
-                st.session_state.activity_log.append("🎉 Automation completed!")
-                st.session_state.is_running = False  # CRITICAL: Set to False immediately
-                st.session_state.needs_refresh = True
-                st.session_state.last_update = time.time()
-                # Don't close immediately - let user see final state
-                time.sleep(1)  # Wait 1 second before closing
-                try:
-                    ws.close()
-                except Exception:
+                elif msg_type == "ping":
                     pass
 
-            elif msg_type == "error":
-                error_msg = data.get("message", "")
-                st.session_state.activity_log.append(error_msg)
-                # Don't stop immediately - might recover
-                if "fatal" in error_msg.lower() or "crash" in error_msg.lower():
-                    st.session_state.is_running = False
-                    ws.close()
-                else:
-                    st.session_state.needs_refresh = True
-                    st.session_state.last_update = time.time()
+                elif msg_type == "leads":
+                    ws_data["extracted_leads"].extend(data.get("data", []))
+                    ws_data["current_lead_count"] = len(ws_data["extracted_leads"])
+                    ws_data["needs_refresh"] = True
+
+                elif msg_type == "lead_count":
+                    ws_data["current_lead_count"] = data.get("count", 0)
+                    ws_data["target_lead_count"] = data.get("target", 0)
+                    ws_data["needs_refresh"] = True
+
+                elif msg_type == "file_saved":
+                    ws_data["saved_files"].append({
+                        "path": data.get("path", ""),
+                        "query": data.get("query", ""),
+                        "count": data.get("count", 0),
+                        "timestamp": datetime.now().strftime("%H:%M:%S"),
+                    })
+                    ws_data["needs_refresh"] = True
+
+                elif msg_type == "complete":
+                    all_leads = data.get("data", [])
+                    if all_leads:
+                        ws_data["extracted_leads"] = all_leads
+                    ws_data["activity_log"].append("🎉 Automation completed!")
+                    ws_data["is_running"] = False
+                    ws_data["needs_refresh"] = True
+                    time.sleep(1)
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+
+                elif msg_type == "error":
+                    error_msg = data.get("message", "")
+                    ws_data["activity_log"].append(error_msg)
+                    if "fatal" in error_msg.lower() or "crash" in error_msg.lower():
+                        ws_data["is_running"] = False
+                        ws.close()
+                    else:
+                        ws_data["needs_refresh"] = True
 
         except Exception as e:
-            st.session_state.activity_log.append(f"❌ Error processing message: {str(e)}")
+            with ws_lock:
+                ws_data["activity_log"].append(f"❌ Error: {str(e)}")
 
     def on_error(ws, error):
-        st.session_state.activity_log.append(f"❌ WebSocket error: {str(error)}")
-        st.session_state.is_running = False
-        st.session_state.websocket_connected = False
+        with ws_lock:
+            ws_data["activity_log"].append(f"❌ WebSocket error: {str(error)}")
+            ws_data["is_running"] = False
 
     def on_close(ws, close_status_code, close_msg):
-        st.session_state.websocket_connected = False
-        st.session_state.is_running = False
+        with ws_lock:
+            ws_data["is_running"] = False
 
     def on_open(ws):
-        st.session_state.websocket_connected = True
-        st.session_state.ws_client = ws  # Store client for stop button
-        # Send start command
-        target_leads = st.session_state.get("target_lead_count", 0)
+        with ws_lock:
+            ws_data["is_running"] = True
         ws.send(json.dumps({
             "command": "start",
             "queries": queries,
@@ -269,24 +278,20 @@ def websocket_client(queries: List[str], max_pages: int, delay_pages: float, del
         }))
 
     try:
-        ws = websocket.WebSocketApp(
+        ws_app = websocket.WebSocketApp(
             WEBSOCKET_URL,
             on_message=on_message,
             on_error=on_error,
             on_close=on_close,
             on_open=on_open,
         )
-        st.session_state.ws_client = ws  # Store before running
-        ws.run_forever()
+        with ws_lock:
+            ws_data["ws_client"] = ws_app
+        ws_app.run_forever()
     except Exception as e:
-        st.session_state.activity_log.append(f"❌ Connection error: {str(e)}")
-        st.session_state.is_running = False
-        st.session_state.websocket_connected = False
-
-
-def run_websocket_client(queries: List[str], max_pages: int, delay_pages: float, delay_actions: float):
-    """Run WebSocket client in background thread."""
-    websocket_client(queries, max_pages, delay_pages, delay_actions)
+        with ws_lock:
+            ws_data["activity_log"].append(f"❌ Connection error: {str(e)}")
+            ws_data["is_running"] = False
 
 
 # ─── License Check ───────────────────────────────────────────────────────────
@@ -382,7 +387,31 @@ def render_bottom_navigation():
 
 
 # ─── Main Extractor Page ─────────────────────────────────────────────────────
+def _sync_ws_data():
+    """Copy data from thread-safe ws_data dict into session_state for rendering."""
+    _ws = st.session_state.ws_data
+    _lock = st.session_state.ws_lock
+    with _lock:
+        if _ws["activity_log"]:
+            st.session_state.activity_log = list(_ws["activity_log"])
+        if _ws["extracted_leads"]:
+            st.session_state.extracted_leads = list(_ws["extracted_leads"])
+        if _ws["current_screenshot"]:
+            st.session_state.current_screenshot = _ws["current_screenshot"]
+        st.session_state.current_lead_count = _ws["current_lead_count"]
+        st.session_state.target_lead_count = _ws["target_lead_count"]
+        if _ws["saved_files"]:
+            st.session_state.saved_files = list(_ws["saved_files"])
+        if not _ws["is_running"] and st.session_state.is_running:
+            st.session_state.is_running = False
+        st.session_state.needs_refresh = _ws["needs_refresh"]
+        _ws["needs_refresh"] = False
+
+
 def render_extractor_page():
+    # Sync thread data into session state on every render
+    _sync_ws_data()
+
     st.markdown('<p class="app-title">🎯 Live Browser Automation</p>', unsafe_allow_html=True)
     st.markdown('<p class="app-subtitle">Watch the browser automate Google searches in real-time</p>', unsafe_allow_html=True)
 
@@ -485,16 +514,24 @@ def render_extractor_page():
         st.session_state.activity_log = []
         st.session_state.extracted_leads = []
         st.session_state.current_screenshot = None
+        with st.session_state.ws_lock:
+            st.session_state.ws_data["activity_log"] = []
+            st.session_state.ws_data["extracted_leads"] = []
+            st.session_state.ws_data["current_screenshot"] = None
+            st.session_state.ws_data["saved_files"] = []
+            st.session_state.ws_data["current_lead_count"] = 0
         st.rerun()
 
     # ── Stop Button Handler ───────────────────────────────────────────────────
     if stop_btn:
         st.session_state.is_running = False
-        if hasattr(st.session_state, 'ws_client') and st.session_state.ws_client:
+        with st.session_state.ws_lock:
+            st.session_state.ws_data["is_running"] = False
+        ws_client = st.session_state.ws_data.get("ws_client")
+        if ws_client:
             try:
-                # Try to send stop command
-                if hasattr(st.session_state.ws_client, 'send'):
-                    st.session_state.ws_client.send(json.dumps({"command": "stop"}))
+                if hasattr(ws_client, 'send'):
+                    ws_client.send(json.dumps({"command": "stop"}))
                     st.session_state.activity_log.append("🛑 Stop command sent to server...")
                 else:
                     st.session_state.activity_log.append("🛑 Stop requested (connection closing...)")
@@ -540,28 +577,29 @@ def render_extractor_page():
             st.session_state.activity_log = []
             st.session_state.current_screenshot = None
             st.session_state.saved_files = []
+            # Reset shared data
+            with st.session_state.ws_lock:
+                ws = st.session_state.ws_data
+                ws["activity_log"] = []
+                ws["extracted_leads"] = []
+                ws["current_screenshot"] = None
+                ws["saved_files"] = []
+                ws["current_lead_count"] = 0
+                ws["is_running"] = True
+                ws["needs_refresh"] = False
 
-            # Start WebSocket client in background thread
+            target_leads = st.session_state.get("target_lead_count", 0)
             thread = threading.Thread(
-                target=run_websocket_client,
-                args=(queries, max_pages, delay_pages, delay_actions),
+                target=websocket_client,
+                args=(queries, max_pages, delay_pages, delay_actions,
+                      st.session_state.ws_data, st.session_state.ws_lock, target_leads),
                 daemon=True,
             )
             thread.start()
 
-    # ── Auto-refresh when running (only when new data arrives) ─────────────
-    if st.session_state.is_running and st.session_state.needs_refresh:
-        current_time = time.time()
-        if not hasattr(st.session_state, 'last_rerun_time'):
-            st.session_state.last_rerun_time = 0
-        
-        if (current_time - st.session_state.last_rerun_time) >= 1.0:
-            st.session_state.needs_refresh = False
-            st.session_state.last_rerun_time = current_time
-            st.rerun()
-    elif st.session_state.is_running:
-        # Poll for updates without rerunning — just schedule a rerun after a short wait
-        time.sleep(0.5)
+    # ── Auto-refresh when running ────────────────────────────────────────────
+    if st.session_state.is_running:
+        time.sleep(1.5)
         st.rerun()
 
     # ── Saved Files Display ─────────────────────────────────────────────────
