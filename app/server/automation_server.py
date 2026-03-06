@@ -323,17 +323,16 @@ class AutomationManager:
         try:
             self.playwright = await async_playwright().start()
             
-            # Auto-detect RDP session and use headless mode if needed
-            # RDP sessions lack GPU acceleration and proper display drivers
-            use_headless = is_rdp_session()
+            # Headless on server (no display) or RDP; headed on desktop with display
+            use_headless = is_rdp_session() or not os.environ.get("DISPLAY") or os.environ.get("RENDER")
             if use_headless:
                 await self.broadcast({
                     "type": "status",
-                    "message": "🔍 RDP session detected - using headless browser mode",
+                    "message": "🖥️ Running in headless browser mode (server/cloud)",
                 })
             
             self.browser = await self.playwright.chromium.launch(
-                headless=use_headless,  # Auto-detect RDP and use headless
+                headless=use_headless,
                 slow_mo=int(delay_between_actions * 1000),
                 args=[
                     "--disable-blink-features=AutomationControlled",
