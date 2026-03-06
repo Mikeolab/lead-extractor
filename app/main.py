@@ -549,21 +549,20 @@ def render_extractor_page():
             )
             thread.start()
 
-    # ── Auto-refresh when running (throttled) ──────────────────────────────
-    if st.session_state.is_running:
-        # Throttle reruns to max 2 per second
+    # ── Auto-refresh when running (only when new data arrives) ─────────────
+    if st.session_state.is_running and st.session_state.needs_refresh:
         current_time = time.time()
         if not hasattr(st.session_state, 'last_rerun_time'):
             st.session_state.last_rerun_time = 0
         
-        if (current_time - st.session_state.last_rerun_time) >= 0.5:  # Max 2 reruns/sec
-            placeholder = st.empty()
-            placeholder.markdown("🔄 Live updates...")
-            time.sleep(0.2)  # Small delay for WebSocket updates
-            if st.session_state.needs_refresh:
-                st.session_state.needs_refresh = False
+        if (current_time - st.session_state.last_rerun_time) >= 1.0:
+            st.session_state.needs_refresh = False
             st.session_state.last_rerun_time = current_time
             st.rerun()
+    elif st.session_state.is_running:
+        # Poll for updates without rerunning — just schedule a rerun after a short wait
+        time.sleep(0.5)
+        st.rerun()
 
     # ── Saved Files Display ─────────────────────────────────────────────────
     if st.session_state.saved_files:

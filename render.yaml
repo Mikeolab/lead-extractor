@@ -8,4 +8,3 @@ services:
     envVars:
       - key: AUTOMATION_SERVER_URL
         value: http://localhost:8000
-    healthCheckPath: /
