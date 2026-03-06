@@ -64,8 +64,8 @@ from app.extractors.name_extractor import extract_contact_names, extract_names_f
 from app.extractors.phone_extractor import extract_phones
 from app.export.pdf_exporter import export_to_pdf
 from app.database.db import save_search, save_leads
-from app.config import EXPORT_DIR, GOOGLE_API_KEY, GOOGLE_CSE_ID
-from app.search.google_search import google_search as _google_cse_search
+from app.config import EXPORT_DIR
+from app.search.brave_search import brave_search as _brave_search
 
 app = FastAPI()
 
@@ -315,191 +315,100 @@ class AutomationManager:
         target_leads: int,
         total_leads_extracted: int,
     ) -> tuple:
-        """Cloud path: use DuckDuckGo HTTP search to get URLs, then visit each
-        with Playwright for lead extraction.  Returns (query_leads, new_lead_count)."""
-        query_leads = []
+        """Cloud path: search via API (Brave primary, DDG fallback), then visit
+        each URL with Playwright to extract leads.  Returns (query_leads, new_lead_count)."""
+        from app.config import BRAVE_API_KEY
+
+        query_leads: list = []
         new_lead_count = 0
 
-        await self.broadcast({
-            "type": "status",
-            "message": "🌐 [CLOUD] Using DuckDuckGo search (avoids Google CAPTCHA on server IPs)",
-        })
-
-        def _normalize_ddg_query(raw: str) -> str:
-            q = (raw or "").strip()
-            # Users often paste Google-style queries with quotes and pluses.
-            q = q.strip("\"'").replace("+", " ")
+        def _clean_query(raw: str) -> str:
+            q = (raw or "").strip().strip("\"'").replace("+", " ")
             q = re.sub(r"\s+", " ", q).strip()
-
-            # DDG HTML endpoint is much more reliable when explicitly filtering PDFs.
-            # If user typed "pdf" but not filetype:pdf, enforce filetype:pdf.
-            q_lower = q.lower()
-            if "filetype:pdf" not in q_lower:
-                q = f"{q} filetype:pdf".strip()
-
-            # Avoid extremely long queries (DDG may return 0 results).
             if len(q) > 260:
                 q = q[:260].rsplit(" ", 1)[0]
             return q
 
-        def _simplify_ddg_query(raw: str) -> str:
-            q = _normalize_ddg_query(raw)
-            # Drop exact emails which often over-constrain results
-            q = re.sub(r"\b[^\s@]+@[^\s@]+\b", " ", q)
-            q = re.sub(r"\s+", " ", q).strip()
-            # Keep the first ~10 tokens + filetype:pdf
-            tokens = [t for t in q.split(" ") if t]
-            kept = []
-            for t in tokens:
-                if t.lower() == "filetype:pdf":
-                    continue
-                kept.append(t)
-                if len(kept) >= 10:
-                    break
-            base = " ".join(kept).strip()
-            return f"{base} filetype:pdf".strip()
+        cleaned = _clean_query(query)
+        results: list = []
 
-        loop = asyncio.get_running_loop()
-        normalized_query = _normalize_ddg_query(query)
-
-        async def _run_ddg(q: str, mode: str):
-            return await loop.run_in_executor(
-                None,
-                lambda: _ddg_search(
-                    q,
-                    num_results=max_pages * 10,
-                    mode=mode,
-                    max_pages=max_pages,
-                    delay_between_pages=delay_between_pages,
-                    max_retries=3,
-                    timeout=15,
-                ),
-            )
-
-        results = []
-        pages_fetched = 0
-
-        # Best option for cloud reliability: Search API (no CAPTCHA / no IP blocks).
-        if GOOGLE_API_KEY and GOOGLE_CSE_ID:
+        # ── 1) Brave Search API (primary — free 2k queries/mo, no CAPTCHA) ──
+        if BRAVE_API_KEY:
             await self.broadcast({
                 "type": "status",
-                "message": "🔎 [CLOUD] Using Google Custom Search API (most reliable for server deployments)",
+                "message": "🔎 [CLOUD] Searching via Brave Search API…",
             })
-            api_resp = await _google_cse_search(
-                normalized_query,
-                api_key=GOOGLE_API_KEY,
-                cse_id=GOOGLE_CSE_ID,
-                num_results=max_pages * 10,
-                start=1,
+            brave_resp = await _brave_search(
+                cleaned,
+                api_key=BRAVE_API_KEY,
+                num_results=min(max_pages * 10, 20),
             )
-            if api_resp.error:
+            if brave_resp.error:
                 await self.broadcast({
                     "type": "status",
-                    "message": f"⚠️ [CLOUD] Search API error: {api_resp.error}",
+                    "message": f"⚠️ [CLOUD] Brave API: {brave_resp.error}",
                 })
             else:
-                results = list(api_resp.results or [])
+                results = list(brave_resp.results or [])
+                if results:
+                    await self.broadcast({
+                        "type": "status",
+                        "message": f"✅ [CLOUD] Brave returned {len(results)} results",
+                    })
 
-        # Otherwise, try progressively less restrictive DDG modes/queries.
-        # 1) PDFs that likely contain emails (best for lead extraction)
-        ddg_result = None
+        # ── 2) DDG fallback (when no Brave key or Brave returned 0) ─────────
         if not results:
-            ddg_result = await _run_ddg(normalized_query, mode="pdf_emails")
-        # 2) Any PDFs
-        if ddg_result and ddg_result.error:
-            ddg_result = await _run_ddg(normalized_query, mode="pdf")
-        # 3) Simplified query (drop emails / truncate tokens)
-        if ddg_result and ddg_result.error:
-            simplified = _simplify_ddg_query(query)
             await self.broadcast({
                 "type": "status",
-                "message": f"⚠️ [CLOUD] No results; retrying with simplified query: \"{simplified}\"",
+                "message": "🌐 [CLOUD] Trying DuckDuckGo search…",
             })
-            ddg_result = await _run_ddg(simplified, mode="pdf")
+            loop = asyncio.get_running_loop()
 
-        if not results and ddg_result:
-            results = list(getattr(ddg_result, "results", []) or [])
-            pages_fetched = int(getattr(ddg_result, "pages_fetched", 0) or 0)
+            async def _run_ddg(q: str, mode: str = "general"):
+                return await loop.run_in_executor(
+                    None,
+                    lambda: _ddg_search(
+                        q,
+                        num_results=max_pages * 10,
+                        mode=mode,
+                        max_pages=max_pages,
+                        delay_between_pages=delay_between_pages,
+                        max_retries=3,
+                        timeout=15,
+                    ),
+                )
 
-        # 4) If still empty, split '+' queries into multiple smaller searches and merge results.
-        if (not results) and ddg_result and ddg_result.error:
-            raw = (query or "").strip().strip("\"'")
-            parts = [p.strip() for p in re.split(r"\s*\+\s*", raw) if p.strip()]
-            # Drop exact emails; they are usually too restrictive for DDG.
-            parts = [p for p in parts if "@" not in p]
+            ddg = await _run_ddg(cleaned, mode="general")
+            if not ddg.error:
+                results = list(ddg.results or [])
 
-            stopwords = {"in", "on", "at", "for", "of", "the", "and", "or", "a", "an"}
+            if not results:
+                simple = re.sub(r"\b[^\s@]+@[^\s@]+\b", " ", cleaned)
+                simple = re.sub(r"\s+", " ", simple).strip()
+                tokens = [t for t in simple.split() if t][:8]
+                simple = " ".join(tokens)
+                if simple != cleaned:
+                    await self.broadcast({
+                        "type": "status",
+                        "message": f"⚠️ [CLOUD] Retrying simplified: \"{simple}\"",
+                    })
+                    ddg = await _run_ddg(simple, mode="general")
+                    if not ddg.error:
+                        results = list(ddg.results or [])
 
-            domain_parts = [p for p in parts if ("." in p and " " not in p)]
-            phrase_parts = [p for p in parts if " " in p]
-
-            # Build a compact keyword context from phrases (exclude domains).
-            keywords: list[str] = []
-            for p in phrase_parts:
-                for t in re.split(r"\s+", p):
-                    tl = t.lower()
-                    if not t or tl in stopwords or tl == "pdf" or "." in t:
-                        continue
-                    keywords.append(t)
-
-            # Prefer a short context phrase (2-4 words) like "vendor invoice ohio"
-            context = " ".join(keywords[:4]).strip()
-
-            candidates: list[str] = []
-            if context:
-                candidates.append(f"{context} filetype:pdf")
-
-            # Try each phrase directly as well (often works best)
-            for p in phrase_parts:
-                base = re.sub(r"\s+", " ", p.replace("pdf", " ")).strip()
-                if base:
-                    candidates.append(f"{base} filetype:pdf")
-
-            # Try each domain with a tiny context (first 1-2 keywords)
-            short_ctx = " ".join(keywords[:2]).strip()
-            for d in domain_parts:
-                if short_ctx:
-                    candidates.append(f"{d} {short_ctx} filetype:pdf")
-                else:
-                    candidates.append(f"{d} filetype:pdf")
-
-            seen_urls: set[str] = set()
-            merged = []
-            fetched_any = 0
-            for idx, cand in enumerate(candidates[:6], start=1):
-                if self.stop_flag:
-                    break
-                await self.broadcast({
-                    "type": "status",
-                    "message": f"⚠️ [CLOUD] Fallback search {idx}/{min(len(candidates), 6)}: \"{cand}\"",
-                })
-                r = await _run_ddg(cand, mode="pdf")
-                fetched_any = max(fetched_any, int(getattr(r, "pages_fetched", 0) or 0))
-                for item in (getattr(r, "results", []) or []):
-                    u = getattr(item, "url", "") or ""
-                    if not u or u in seen_urls:
-                        continue
-                    seen_urls.add(u)
-                    merged.append(item)
-                    if len(merged) >= max_pages * 10:
-                        break
-                if len(merged) >= max_pages * 10:
-                    break
-
-            results = merged
-            pages_fetched = fetched_any
-
+        # ── 3) Give up ──────────────────────────────────────────────────────
         if not results:
+            tip = "Set BRAVE_API_KEY for reliable cloud search" if not BRAVE_API_KEY else "Try a simpler query"
             await self.broadcast({
                 "type": "status",
-                "message": f"⚠️ [CLOUD] Search error: {(ddg_result.error if ddg_result else 'No results')} (tip: add 'filetype:pdf', simplify query, or configure GOOGLE_API_KEY + GOOGLE_CSE_ID for cloud reliability)",
+                "message": f"⚠️ [CLOUD] No search results found. {tip}.",
             })
             return query_leads, new_lead_count
 
-        urls = [(r.url, r.title, r.display_link) for r in results]
+        urls = [(r.url, r.title, getattr(r, "display_link", "")) for r in results]
         await self.broadcast({
             "type": "status",
-            "message": f"✅ [CLOUD] DuckDuckGo returned {len(urls)} results from {pages_fetched} page(s)",
+            "message": f"✅ [CLOUD] {len(urls)} results to process",
         })
 
         processed = 0

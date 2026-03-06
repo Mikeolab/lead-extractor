@@ -66,6 +66,9 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
+# Brave Search API (free: 2,000 queries/month, no CAPTCHA from server IPs)
+BRAVE_API_KEY = os.getenv("BRAVE_API_KEY", "")
+
 # License secret (used for HMAC signing - keep this safe)
 LICENSE_SECRET = "lead-extractor-pro-2026-secret-key"
 

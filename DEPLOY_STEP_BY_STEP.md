@@ -92,9 +92,19 @@ In the Render service → **Environment** tab, add:
 |-----|-------|------|
 | `DATABASE_URL` | `postgresql://...` | Paste full Neon connection string from Step 2 |
 | `AUTOMATION_SERVER_URL` | `http://localhost:8000` | Same container; API runs on 8000 |
-| `GOOGLE_API_KEY` | *(if you use Google Search)* | Optional |
-| `GOOGLE_CSE_ID` | *(if you use Google Search)* | Optional |
+| `BRAVE_API_KEY` | `BSA...` | **Recommended** — free 2k queries/mo, no CAPTCHA. See below |
 | `LICENSE_KEY` | *(if using license checks)* | Optional |
+
+### Get a free Brave Search API key (2 minutes)
+
+1. Go to **https://api-dashboard.search.brave.com/** → Sign up / Log in.
+2. Click **API Keys** → **+ Create Key**.
+3. Copy the key (starts with `BSA`).
+4. Paste it as the `BRAVE_API_KEY` value above.
+
+Without this key the app falls back to DuckDuckGo scraping, which is
+unreliable from datacenter IPs (rate-limited). With the key, cloud search
+works instantly — 2,000 free searches per month.
 
 **Important:** For `DATABASE_URL`, use the full Neon URL (including `?sslmode=require` if present).
 
