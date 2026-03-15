@@ -210,7 +210,6 @@ def ddg_search(
         all_results = []
         pages_fetched = 0
         last_html = ""
-        saw_rate_limit = False
 
         for page_num in range(1, max_pages + 1):
             # Check stop flag
@@ -246,12 +245,9 @@ def ddg_search(
                     if hasattr(resp, "status_code") and resp.status_code not in (200, 202):
                         raise Exception(f"HTTP {resp.status_code}")
 
-                    # DDG sometimes returns a 202 + "anomaly" interstitial when rate limited.
-                    # Treat this as a retryable rate-limit condition (not "0 results").
-                    if "anomaly" in resp.text.lower() or (getattr(resp, "status_code", 200) == 202 and "result" not in resp.text.lower()):
+                    if "anomaly" in resp.text.lower():
                         if callback:
                             callback(f"   ⚠️ Rate limited (attempt {attempt}/{max_retries}), waiting...")
-                        saw_rate_limit = True
                         time.sleep(5 * attempt)
                         session = _get_session()  # New session with new UA
                         continue
@@ -292,12 +288,6 @@ def ddg_search(
         all_results = all_results[:num_results]
 
         if not all_results:
-            if saw_rate_limit:
-                return SearchResponse(
-                    query=query, total_results=0, search_mode=mode,
-                    pages_fetched=pages_fetched,
-                    error="Rate limited by DuckDuckGo (server IP). Wait 1–2 minutes and retry, or configure a search API for reliable cloud results.",
-                )
             return SearchResponse(
                 query=query, total_results=0, search_mode=mode,
                 pages_fetched=pages_fetched,

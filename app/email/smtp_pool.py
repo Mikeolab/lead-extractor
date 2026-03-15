@@ -7,8 +7,12 @@ import smtplib
 import threading
 import time
 from typing import Dict, Optional, List
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+# Use importlib to force stdlib email (avoids collision with app.email in PyInstaller bundle)
+import importlib
+_mime_text = importlib.import_module('email.mime.text')
+_mime_multipart = importlib.import_module('email.mime.multipart')
+MIMEText = _mime_text.MIMEText
+MIMEMultipart = _mime_multipart.MIMEMultipart
 from collections import defaultdict
 
 

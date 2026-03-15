@@ -14,10 +14,9 @@ venv/
 *.egg-info/
 .eggs/
 
-# Build & dist
+# Build & dist (specs are tracked for Windows build)
 build/
 dist/
-*.spec
 *.app
 
 # Data & exports (local)
@@ -25,6 +24,9 @@ data/
 exports/
 *.db
 leads.db
+
+# Generated zips
+*.zip
 
 # IDE & OS
 .DS_Store

@@ -12,12 +12,6 @@ from app.config import DATABASE_PATH
 # When DATABASE_URL is set (e.g. on Render + Neon), use PostgreSQL
 _use_postgres = bool(os.environ.get("DATABASE_URL"))
 
-
-def using_postgres() -> bool:
-    """True when app is using PostgreSQL (e.g. Neon); use for DDL/compatibility."""
-    return _use_postgres
-
-
 if _use_postgres:
     from app.database import db_postgres as _db
 else:
@@ -122,13 +116,6 @@ def get_connection():
         CREATE INDEX IF NOT EXISTS idx_queue_status ON email_queue(status, priority DESC, scheduled_at);
         CREATE INDEX IF NOT EXISTS idx_queue_mailbox ON email_queue(mailbox_id, status);
         CREATE INDEX IF NOT EXISTS idx_queue_campaign ON email_queue(campaign_id, status);
-
-        -- One active session per license (no two places at once)
-        CREATE TABLE IF NOT EXISTS license_active_sessions (
-            license_key TEXT PRIMARY KEY,
-            session_id TEXT NOT NULL,
-            last_seen_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
     """)
 
     conn.commit()
@@ -150,7 +137,7 @@ def save_search(query: str, num_results: int = 0) -> int:
     return search_id
 
 
-def save_leads(search_id: int, leads: list[dict]) -> int:
+def save_leads(search_id: int, leads: list[dict], replace: bool = False) -> int:
     """
     Save a batch of leads for a search.
 
@@ -158,6 +145,7 @@ def save_leads(search_id: int, leads: list[dict]) -> int:
         search_id: The search ID to associate leads with
         leads: List of lead dicts with keys: business_name, contact_name,
                email, phone, website, source_url, snippet
+        replace: If True, delete existing leads for this search first (for incremental saves)
 
     Returns:
         Number of leads saved
@@ -165,9 +153,11 @@ def save_leads(search_id: int, leads: list[dict]) -> int:
     if not leads:
         return 0
     if _use_postgres and _db:
-        return _db.save_leads(search_id, leads)
+        return _db.save_leads(search_id, leads, replace=replace)
 
     conn = get_connection()
+    if replace:
+        conn.execute("DELETE FROM leads WHERE search_id = ?", (search_id,))
     count = 0
 
     for lead in leads:

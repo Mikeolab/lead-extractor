@@ -67,9 +67,23 @@ def validate_license(license_key: str, secret: str) -> LicenseInfo:
                 error="License key has expired",
             )
         
-        # Check machine_id if present in payload
+        # Check machine binding if present (machine_id or machine_ids)
+        machine_ids = payload.get("machine_ids")
         machine_id = payload.get("machine_id")
-        if machine_id:
+        if machine_ids:
+            from app.license.machine_id import get_machine_id
+            current = get_machine_id().lower()
+            allowed = [m.lower() for m in machine_ids]
+            if current not in allowed:
+                return LicenseInfo(
+                    valid=False,
+                    licensee=payload.get("licensee", ""),
+                    plan=payload.get("plan", ""),
+                    issued_at=payload.get("issued_at", ""),
+                    expires_at=payload.get("expires_at", ""),
+                    error="License not valid for this computer",
+                )
+        elif machine_id:
             from app.license.machine_id import get_machine_id, validate_machine_id
             current_machine_id = get_machine_id()
             if not validate_machine_id(machine_id, current_machine_id):

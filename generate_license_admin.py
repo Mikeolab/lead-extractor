@@ -45,8 +45,16 @@ Examples:
     
     parser.add_argument(
         "--machine-id",
-        required=True,
-        help="Hardware ID from user's computer (16-char hex, e.g., '70998ed59f0f1577')"
+        help="Hardware ID from user's computer (16-char hex). Omit with --no-machine-id for floating license."
+    )
+    parser.add_argument(
+        "--machine-ids",
+        help="Comma-separated list of Machine IDs (e.g., 'id1,id2,id3') - license works on any listed machine"
+    )
+    parser.add_argument(
+        "--no-machine-id",
+        action="store_true",
+        help="Floating license: works on any computer (use when machine ID changes often)"
     )
     
     parser.add_argument(
@@ -93,12 +101,27 @@ Examples:
         days_valid = 365
         validity_description = "1 year (default)"
     
-    # Validate machine ID format
-    machine_id = args.machine_id.replace("-", "").replace(" ", "").lower()
-    if len(machine_id) != 16 or not all(c in '0123456789abcdef' for c in machine_id):
-        print(f"❌ Error: Invalid machine ID format. Expected 16-character hex string.")
-        print(f"   Received: {args.machine_id}")
-        print(f"   Example: 70998ed59f0f1577")
+    # Resolve machine binding
+    machine_id = ""
+    machine_ids = []
+    if args.no_machine_id:
+        pass  # Floating license - no machine binding
+    elif args.machine_ids:
+        ids = [m.replace("-", "").replace(" ", "").lower().strip() for m in args.machine_ids.split(",") if m.strip()]
+        for m in ids:
+            if len(m) != 16 or not all(c in '0123456789abcdef' for c in m):
+                print(f"❌ Error: Invalid machine ID in list: {m}")
+                sys.exit(1)
+        machine_ids = ids
+    elif args.machine_id:
+        machine_id = args.machine_id.replace("-", "").replace(" ", "").lower()
+        if len(machine_id) != 16 or not all(c in '0123456789abcdef' for c in machine_id):
+            print(f"❌ Error: Invalid machine ID format. Expected 16-character hex string.")
+            print(f"   Received: {args.machine_id}")
+            print(f"   Example: 70998ed59f0f1577")
+            sys.exit(1)
+    else:
+        print("❌ Error: Specify --machine-id, --machine-ids, or --no-machine-id")
         sys.exit(1)
     
     # Generate license key
@@ -107,6 +130,7 @@ Examples:
             secret=LICENSE_SECRET,
             licensee_name=args.name,
             machine_id=machine_id,
+            machine_ids=machine_ids,
             plan=args.plan,
             days_valid=days_valid
         )
@@ -116,7 +140,12 @@ Examples:
         print("="*60)
         print(f"\nLicensee: {args.name}")
         print(f"Plan: {args.plan.upper()}")
-        print(f"Machine ID: {machine_id}")
+        if args.no_machine_id:
+            print(f"Binding: FLOATING (works on any computer)")
+        elif machine_ids:
+            print(f"Machines: {len(machine_ids)} machine(s)")
+        else:
+            print(f"Machine ID: {machine_id}")
         print(f"Validity: {validity_description}")
         if args.type == "lifetime":
             print(f"   (Effectively permanent - 100 years)")

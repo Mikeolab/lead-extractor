@@ -1,102 +1,78 @@
 @echo off
-REM Build Windows .exe for Lead Extractor Pro
-REM This script creates a standalone Windows executable
+REM Build Lead Extractor Pro for Windows
+REM Run this script ON A WINDOWS MACHINE (PyInstaller cannot cross-compile)
+REM Prerequisites: Python 3.9+ with pip, all requirements installed
 
-echo ========================================
-echo Lead Extractor Pro - Windows Build
-echo ========================================
+echo ============================================
+echo  Lead Extractor Pro - Windows Build
+echo ============================================
 echo.
 
-REM Check if Python is available
-python --version >nul 2>&1
+REM Check Python
+python --version 2>nul
 if errorlevel 1 (
-    echo ERROR: Python not found! Please install Python 3.9+ and add it to PATH.
+    echo ERROR: Python not found. Install Python 3.9+ from python.org
     pause
     exit /b 1
 )
 
-REM Check if pip is available (fix broken Python installs)
-python -m pip --version >nul 2>&1
+REM Upgrade pip
+echo Upgrading pip...
+python -m pip install --upgrade pip --quiet
+
+REM Install requirements
+echo Installing requirements...
+pip install -r requirements.txt --quiet
 if errorlevel 1 (
-    echo pip not found. Installing pip...
-    powershell -Command "Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.py' -OutFile 'get-pip.py' -UseBasicParsing"
-    python get-pip.py
-    del get-pip.py 2>nul
+    echo ERROR: Failed to install requirements
+    pause
+    exit /b 1
 )
 
-REM Check if PyInstaller is installed
-echo Checking PyInstaller...
-python -m pip show pyinstaller >nul 2>&1
+REM Install PyInstaller
+echo Installing PyInstaller...
+pip install pyinstaller --quiet
+
+REM Install Playwright Chromium to LOCAL folder (bundled with exe)
+echo Installing Playwright Chromium to playwright_browsers...
+if not exist "playwright_browsers" mkdir playwright_browsers
+set PLAYWRIGHT_BROWSERS_PATH=%CD%\playwright_browsers
+python -m playwright install chromium
 if errorlevel 1 (
-    echo PyInstaller not found. Installing...
-    python -m pip install pyinstaller
-    if errorlevel 1 (
-        echo ERROR: Failed to install PyInstaller!
-        pause
-        exit /b 1
-    )
+    echo WARNING: Playwright install may have failed. The .exe will still build,
+    echo but automation may not work until you run: python -m playwright install chromium
 )
 
-REM Always install/update dependencies before build
-echo Installing dependencies from requirements.txt...
-python -m pip install -r requirements.txt --quiet
-if errorlevel 1 (
-    echo WARNING: Some dependencies may have failed. Continuing anyway...
-)
+REM Clean previous build
+echo Cleaning previous build...
+if exist "dist\LeadExtractorPro.exe" del /q "dist\LeadExtractorPro.exe"
+if exist "build" rmdir /s /q build 2>nul
 
-REM Clean previous builds
-echo.
-echo Cleaning previous builds...
-if exist build rmdir /s /q build
-if exist dist rmdir /s /q dist
-if exist "LeadExtractorPro_windows.spec" (
-    echo Keeping spec file for reference...
-)
-
-REM Build the app using spec file
+REM Build with PyInstaller
 echo.
 echo Building LeadExtractorPro.exe...
-echo This may take several minutes...
+echo This may take 5-15 minutes...
 echo.
+pyinstaller --clean --noconfirm LeadExtractorPro_windows.spec
 
-python -m PyInstaller --clean --noconfirm LeadExtractorPro_windows.spec
-
-REM Check if build succeeded
-if exist "dist\LeadExtractorPro.exe" (
+if errorlevel 1 (
     echo.
-    echo ========================================
-    echo Build successful!
-    echo ========================================
-    echo.
-    echo App location: dist\LeadExtractorPro.exe
-    echo File size: 
-    dir "dist\LeadExtractorPro.exe" | find "LeadExtractorPro.exe"
-    echo.
-    echo Next steps:
-    echo 1. Test the app: Run dist\LeadExtractorPro.exe
-    echo 2. Test on a clean Windows machine (no Python installed)
-    echo 3. Create installer (optional, use NSIS or Inno Setup)
-    echo 4. Distribute to users
-    echo.
-    echo NOTE: Playwright browsers may need to be installed separately
-    echo       Run: playwright install chromium
-    echo       Or bundle browsers in the installer
-    echo.
-) else (
-    echo.
-    echo ========================================
-    echo Build failed!
-    echo ========================================
-    echo.
-    echo Check the errors above for details.
-    echo Common issues:
-    echo - Missing dependencies (run: python -m pip install -r requirements.txt)
-    echo - PyInstaller issues (try: python -m pip install --upgrade pyinstaller)
-    echo - Path issues with app folder
-    echo.
+    echo ERROR: Build failed. Check errors above.
     pause
     exit /b 1
 )
 
+echo.
+echo ============================================
+echo  BUILD SUCCESSFUL
+echo ============================================
+echo.
+echo Output: dist\LeadExtractorPro.exe
+echo.
+echo Next steps:
+echo   1. Copy the entire "dist" folder to the target Windows PC
+echo   2. Run dist\LeadExtractorPro.exe
+echo   3. On first run, if automation fails, run: python -m playwright install chromium
+echo      from the same folder (or install Python + run that in the project folder)
+echo.
 pause
-

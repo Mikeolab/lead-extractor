@@ -17,6 +17,7 @@ def generate_license_key(
     secret: str,
     licensee_name: str,
     machine_id: str = "",
+    machine_ids: Optional[list] = None,
     plan: str = "pro",
     days_valid: int = 365,
 ) -> str:
@@ -26,7 +27,8 @@ def generate_license_key(
     Args:
         secret: The signing secret
         licensee_name: Name of the license holder
-        machine_id: Machine ID to bind license to (optional, but recommended)
+        machine_id: Single machine ID to bind to (optional)
+        machine_ids: List of machine IDs - license valid on any of these (optional)
         plan: License plan (free, pro, enterprise)
         days_valid: Number of days the license is valid
 
@@ -42,10 +44,12 @@ def generate_license_key(
         "issued_at": issued_at,
         "expires_at": expires_at,
     }
-    
-    # Add machine_id if provided
-    if machine_id:
-        payload["machine_id"] = machine_id
+
+    # Add machine binding (if any)
+    if machine_ids:
+        payload["machine_ids"] = [m.replace("-", "").replace(" ", "").lower() for m in machine_ids]
+    elif machine_id:
+        payload["machine_id"] = machine_id.replace("-", "").replace(" ", "").lower()
 
     payload_json = json.dumps(payload, sort_keys=True)
     payload_b64 = base64.urlsafe_b64encode(payload_json.encode()).decode()

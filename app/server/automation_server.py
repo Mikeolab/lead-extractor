@@ -11,17 +11,16 @@ import time
 import io
 import os
 import sys
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, Page, Browser
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 import pdfplumber
 import httpx
-from app.search.ddg_search import ddg_search as _ddg_search
-import re
 
 
 def is_rdp_session() -> bool:
@@ -65,7 +64,6 @@ from app.extractors.phone_extractor import extract_phones
 from app.export.pdf_exporter import export_to_pdf
 from app.database.db import save_search, save_leads
 from app.config import EXPORT_DIR
-from app.search.brave_search import brave_search as _brave_search
 
 app = FastAPI()
 
@@ -85,6 +83,7 @@ class AutomationManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
         self.browser: Optional[Browser] = None
+        self._persistent_context = None  # For macOS launch_persistent_context
         self.page: Optional[Page] = None
         self.playwright = None
         self.is_running = False
@@ -120,13 +119,20 @@ class AutomationManager:
         asyncio.ensure_future(self._broadcast_browser_closed())
 
     async def _broadcast_browser_closed(self):
-        """Send 'complete' to UI so it clears Running state when user closes the browser."""
+        """Save all leads and send 'complete' to UI when user closes the browser."""
         if getattr(self, "_browser_closed_completion_sent", False):
             return
         self._browser_closed_completion_sent = True
         try:
-            await self.broadcast({"type": "status", "message": "🔚 Browser closed by user"})
-            await self.broadcast({"type": "complete", "data": []})
+            await self.broadcast({"type": "status", "message": "🔚 Browser closed by user - saving leads..."})
+            # CRITICAL: Save all accumulated leads before sending complete (replace=True = overwrite with full buffer)
+            if self.all_leads_buffer and self.current_session_id:
+                try:
+                    save_leads(self.current_session_id, self.all_leads_buffer, replace=True)
+                    await self.broadcast({"type": "status", "message": f"💾 Saved {len(self.all_leads_buffer)} leads to database"})
+                except Exception as e:
+                    await self.broadcast({"type": "status", "message": f"⚠️ Save error: {str(e)[:50]}"})
+            await self.broadcast({"type": "complete", "data": list(self.all_leads_buffer)})
         except Exception:
             pass
 
@@ -307,169 +313,6 @@ class AutomationManager:
 
         return leads
 
-    async def _cloud_search_query(
-        self,
-        query: str,
-        max_pages: int,
-        delay_between_pages: float,
-        target_leads: int,
-        total_leads_extracted: int,
-    ) -> tuple:
-        """Cloud path: search via API (Brave primary, DDG fallback), then visit
-        each URL with Playwright to extract leads.  Returns (query_leads, new_lead_count)."""
-        from app.config import BRAVE_API_KEY
-
-        query_leads: list = []
-        new_lead_count = 0
-
-        def _clean_query(raw: str) -> str:
-            q = (raw or "").strip().strip("\"'").replace("+", " ")
-            q = re.sub(r"\s+", " ", q).strip()
-            if len(q) > 260:
-                q = q[:260].rsplit(" ", 1)[0]
-            return q
-
-        cleaned = _clean_query(query)
-        results: list = []
-
-        # ── 1) Brave Search API (primary — free 2k queries/mo, no CAPTCHA) ──
-        if BRAVE_API_KEY:
-            await self.broadcast({
-                "type": "status",
-                "message": "🔎 [CLOUD] Searching via Brave Search API…",
-            })
-            brave_resp = await _brave_search(
-                cleaned,
-                api_key=BRAVE_API_KEY,
-                num_results=min(max_pages * 10, 20),
-            )
-            if brave_resp.error:
-                await self.broadcast({
-                    "type": "status",
-                    "message": f"⚠️ [CLOUD] Brave API: {brave_resp.error}",
-                })
-            else:
-                results = list(brave_resp.results or [])
-                if results:
-                    await self.broadcast({
-                        "type": "status",
-                        "message": f"✅ [CLOUD] Brave returned {len(results)} results",
-                    })
-
-        # ── 2) DDG fallback (when no Brave key or Brave returned 0) ─────────
-        if not results:
-            await self.broadcast({
-                "type": "status",
-                "message": "🌐 [CLOUD] Trying DuckDuckGo search…",
-            })
-            loop = asyncio.get_running_loop()
-
-            async def _run_ddg(q: str, mode: str = "general"):
-                return await loop.run_in_executor(
-                    None,
-                    lambda: _ddg_search(
-                        q,
-                        num_results=max_pages * 10,
-                        mode=mode,
-                        max_pages=max_pages,
-                        delay_between_pages=delay_between_pages,
-                        max_retries=3,
-                        timeout=15,
-                    ),
-                )
-
-            ddg = await _run_ddg(cleaned, mode="general")
-            if not ddg.error:
-                results = list(ddg.results or [])
-
-            if not results:
-                simple = re.sub(r"\b[^\s@]+@[^\s@]+\b", " ", cleaned)
-                simple = re.sub(r"\s+", " ", simple).strip()
-                tokens = [t for t in simple.split() if t][:8]
-                simple = " ".join(tokens)
-                if simple != cleaned:
-                    await self.broadcast({
-                        "type": "status",
-                        "message": f"⚠️ [CLOUD] Retrying simplified: \"{simple}\"",
-                    })
-                    ddg = await _run_ddg(simple, mode="general")
-                    if not ddg.error:
-                        results = list(ddg.results or [])
-
-        # ── 3) Give up ──────────────────────────────────────────────────────
-        if not results:
-            tip = "Set BRAVE_API_KEY for reliable cloud search" if not BRAVE_API_KEY else "Try a simpler query"
-            await self.broadcast({
-                "type": "status",
-                "message": f"⚠️ [CLOUD] No search results found. {tip}.",
-            })
-            return query_leads, new_lead_count
-
-        urls = [(r.url, r.title, getattr(r, "display_link", "")) for r in results]
-        await self.broadcast({
-            "type": "status",
-            "message": f"✅ [CLOUD] {len(urls)} results to process",
-        })
-
-        processed = 0
-        for url, title, display_link in urls:
-            if self.stop_flag:
-                break
-            if target_leads > 0 and (total_leads_extracted + new_lead_count) >= target_leads:
-                await self.broadcast({
-                    "type": "status",
-                    "message": f"🎯 Target reached! {total_leads_extracted + new_lead_count} leads. Stopping...",
-                })
-                self.stop_flag = True
-                break
-
-            processed += 1
-            await self.broadcast({
-                "type": "status",
-                "message": f"  📄 [{processed}/{len(urls)}] Visiting: {title[:50]}",
-            })
-
-            try:
-                await self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                try:
-                    await self.page.wait_for_load_state("networkidle", timeout=15000)
-                except Exception:
-                    pass
-
-                screenshot = await self.take_screenshot(force=True)
-                if screenshot:
-                    await self.broadcast({"type": "screenshot", "data": screenshot})
-
-                pdf_leads = await self.extract_from_pdf(url, title, display_link)
-                if pdf_leads:
-                    for lead in pdf_leads:
-                        lead["search_query"] = query
-                    query_leads.extend(pdf_leads)
-                    new_lead_count += len(pdf_leads)
-                    await self.broadcast({
-                        "type": "lead_count",
-                        "count": total_leads_extracted + new_lead_count,
-                        "target": target_leads,
-                    })
-                    await self.broadcast({
-                        "type": "status",
-                        "message": f"  ✅ [{processed}] Extracted {len(pdf_leads)} leads | Total: {total_leads_extracted + new_lead_count}",
-                    })
-                else:
-                    await self.broadcast({
-                        "type": "status",
-                        "message": f"  ⚠️ [{processed}] No leads on this page",
-                    })
-
-                await asyncio.sleep(delay_between_pages)
-            except Exception as e:
-                await self.broadcast({
-                    "type": "status",
-                    "message": f"  ❌ [{processed}] Error: {str(e)[:80]}",
-                })
-
-        return query_leads, new_lead_count
-
     async def run_automation(
         self,
         queries: List[str],
@@ -477,6 +320,9 @@ class AutomationManager:
         delay_between_pages: float = 3.0,
         delay_between_actions: float = 1.0,
         target_leads: int = 0,  # Target lead count (0 = no limit)
+        search_engine: str = "duckduckgo",  # "duckduckgo" avoids Google CAPTCHA
+        headless: bool = False,  # False = visible browser (from Settings)
+        reload_between_queries: bool = False,  # Fresh browser between each batch query
     ):
         """Run browser automation loop through multiple queries."""
         self.is_running = True
@@ -486,30 +332,22 @@ class AutomationManager:
         self._event_loop = asyncio.get_running_loop()
         self._browser_closed_completion_sent = False
 
+        await self.broadcast({"type": "status", "message": "🚀 Automation starting..."})
         try:
             self.playwright = await async_playwright().start()
-            
-            # Headless on server (no display) or RDP; headed on desktop with display
-            use_headless = is_rdp_session() or not os.environ.get("DISPLAY") or os.environ.get("RENDER")
-            if use_headless:
-                await self.broadcast({
-                    "type": "status",
-                    "message": "🖥️ Running in headless browser mode (server/cloud)",
-                })
-            
-            self.browser = await self.playwright.chromium.launch(
-                headless=use_headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-web-security",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                ],
-            )
 
-            # When user closes the external browser: set flags AND immediately tell the UI so "Running" clears
+            # RDP = force headless. Otherwise respect user's headless setting (including on macOS).
+            # Headless works everywhere (Cursor, Terminal, CI) and still logs activity + extracts emails.
+            use_headless = is_rdp_session() or headless
+            print(f"[Automation] headless={headless} (from UI), use_headless={use_headless}", file=sys.stderr, flush=True)
+
+            if is_rdp_session():
+                await self.broadcast({"type": "status", "message": "🔍 RDP detected - headless mode"})
+            elif use_headless:
+                await self.broadcast({"type": "status", "message": "🔍 Headless mode"})
+            else:
+                await self.broadcast({"type": "status", "message": "🌐 Launching visible browser..."})
+
             def on_browser_disconnected():
                 self.stop_flag = True
                 self.is_running = False
@@ -519,20 +357,76 @@ class AutomationManager:
                         loop.call_soon_thread_safe(self._schedule_browser_closed_complete)
                 except Exception:
                     pass
+
+            # On macOS visible mode: use system Chrome (channel=chrome) - more reliable window display
+            launch_opts = dict(
+                headless=use_headless,
+                slow_mo=int(delay_between_actions * 1000),
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                ],
+            )
+            if not use_headless:
+                launch_opts["args"].append("--start-maximized")  # Make automation window obvious
+            # Chrome 112+ "new" headless = same engine as headed (better DuckDuckGo/Google)
+            if use_headless:
+                launch_opts["args"].append("--headless=new")
+                launch_opts["ignore_default_args"] = ["--headless"]  # Use our --headless=new instead
+                # Use system Chrome for headless on macOS - better compatibility than bundled Chromium
+                if sys.platform == "darwin":
+                    launch_opts["channel"] = "chrome"
+            else:
+                # Visible mode: start maximized; disable GPU to avoid macOS hangs (browser opens but stays blank)
+                launch_opts["args"].extend(["--start-maximized", "--window-position=0,0"])
+                if sys.platform == "darwin":
+                    launch_opts["args"].extend(["--disable-gpu", "--disable-software-rasterizer"])
+            # Visible mode: use PLAIN Chromium (not system Chrome) - diagnostic showed it pops up reliably
+            try:
+                print(f"[Automation] Launching browser: headless={use_headless}", file=sys.stderr, flush=True)
+                self.browser = await self.playwright.chromium.launch(**launch_opts)
+                print(f"[Automation] Browser launched successfully", flush=True)
+            except Exception as e:
+                err_str = str(e).lower()
+                # ENOENT / spawn = bundled Chromium missing (common with PyInstaller exe)
+                if "enoent" in err_str or "spawn" in err_str or "failed to launch" in err_str:
+                    await self.broadcast({"type": "status", "message": "⚠️ Bundled browser not found, trying system Chrome..."})
+                    try:
+                        launch_opts["channel"] = "chrome"
+                        self.browser = await self.playwright.chromium.launch(**launch_opts)
+                        print(f"[Automation] Browser launched via system Chrome", flush=True)
+                    except Exception as e2:
+                        await self.broadcast({
+                            "type": "status",
+                            "message": "❌ Install Chrome or run: pip install playwright && playwright install chromium",
+                        })
+                        raise
+                elif "channel" in launch_opts:
+                    del launch_opts["channel"]
+                    await self.broadcast({"type": "status", "message": "⚠️ Chrome not found, using Chromium"})
+                    self.browser = await self.playwright.chromium.launch(**launch_opts)
+                else:
+                    raise
             self.browser.on("disconnected", on_browser_disconnected)
 
-            # Create context with better stealth settings
-            context = await self.browser.new_context(
-                viewport={"width": 1920, "height": 1080},  # More realistic size
+            print("[Automation] Creating browser context...", file=sys.stderr, flush=True)
+            context_opts = dict(
+                viewport={"width": 1920, "height": 1080},
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 locale="en-US",
                 timezone_id="America/New_York",
                 permissions=["geolocation"],
-                geolocation={"latitude": 40.7128, "longitude": -74.0060},  # New York
+                geolocation={"latitude": 40.7128, "longitude": -74.0060},
                 color_scheme="light",
             )
-            
-            # Add extra headers to look more like a real browser
+            context = await self.browser.new_context(**context_opts)
+            self._context_opts = context_opts  # For reload-between-batches
+            self._context = context
+
             await context.set_extra_http_headers({
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
@@ -541,10 +435,29 @@ class AutomationManager:
                 "Connection": "keep-alive",
                 "Upgrade-Insecure-Requests": "1",
             })
-            
+            print("[Automation] Context created, creating page...", file=sys.stderr, flush=True)
+
             self.page = await context.new_page()
-            
+            self.page.on("close", on_browser_disconnected)
+            print("[Automation] Page created, bringing to front...", file=sys.stderr, flush=True)
+            try:
+                await self.page.bring_to_front()
+            except Exception:
+                pass
+            # macOS: try to bring browser window to front (Chrome/Chromium - must match channel used above)
+            if sys.platform == "darwin" and not use_headless:
+                try:
+                    for app_name in ["Google Chrome", "Chromium", "Chrome"]:
+                        subprocess.run(
+                            ["osascript", "-e", f'tell application "{app_name}" to activate'],
+                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2
+                        )
+                        break  # Try first available
+                except Exception:
+                    pass
+
             # Remove webdriver property
+            print("[Automation] Injecting anti-detection scripts...", file=sys.stderr, flush=True)
             await self.page.add_init_script("""
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => undefined
@@ -569,24 +482,121 @@ class AutomationManager:
                 );
             """)
 
+            print("[Automation] Setup complete, starting query loop...", file=sys.stderr, flush=True)
+            engine_msg = "🦆 DuckDuckGo (no CAPTCHA)" if search_engine == "duckduckgo" else "🔍 Google (may show CAPTCHA)"
             await self.broadcast({
                 "type": "status",
-                "message": f"🚀 Starting automation - {len(queries)} queries",
+                "message": f"🚀 Starting automation - {len(queries)} queries | Search engine: {engine_msg}",
             })
 
             session_start_time = datetime.now()
             self.all_leads_buffer = []  # Reset buffer
 
-            # Loop through queries
-            for query_idx, query in enumerate(queries):
+            # Query queue: extend when DDG runs out of pages and we need more for target (e.g. 10k)
+            DDG_QUERY_VARIATIONS = [
+                " list", " directory", " email directory", " staff directory",
+                " contact list", " member directory", " phone directory", " directory contact",
+            ]
+            query_queue = list(queries)
+            variation_idx = 0
+            query_idx = 0
+
+            # Init script for anti-detection (reused when reloading context)
+            _init_script = """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en']
+                });
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+            """
+
+            while query_queue and not self.stop_flag:
+                query = query_queue.pop(0)
+                query_idx += 1
                 if self.stop_flag:
                     await self.broadcast({"type": "status", "message": "🛑 Stopped by user"})
                     break
 
-                try:
+                # Reload browser between batches (fresh context for each query after the first)
+                reload_ok = True
+                if reload_between_queries and query_idx > 1:
                     await self.broadcast({
                         "type": "status",
-                        "message": f"--- Query {query_idx + 1}/{len(queries)}: \"{query}\" ---",
+                        "message": "🔄 Reloading browser for next batch (save → fresh start)...",
+                    })
+                    for reload_attempt in range(1, 4):
+                        try:
+                            if self.page:
+                                await self.page.close()
+                                self.page = None
+                            if getattr(self, "_context", None):
+                                await self._context.close()
+                                self._context = None
+                        except Exception as e:
+                            await self.broadcast({"type": "status", "message": f"⚠️ Close error: {str(e)[:40]}"})
+                        await asyncio.sleep(2)
+                        try:
+                            self._context = await self.browser.new_context(**self._context_opts)
+                            await self._context.set_extra_http_headers({
+                                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                                "Accept-Language": "en-US,en;q=0.9",
+                                "Accept-Encoding": "gzip, deflate, br",
+                                "DNT": "1",
+                                "Connection": "keep-alive",
+                                "Upgrade-Insecure-Requests": "1",
+                            })
+                            self.page = await self._context.new_page()
+                            self.page.on("close", on_browser_disconnected)
+                            await self.page.add_init_script(_init_script)
+                            await self.broadcast({"type": "status", "message": "✅ Fresh browser ready for next batch"})
+                            reload_ok = True
+                            break
+                        except Exception as e:
+                            await self.broadcast({"type": "status", "message": f"❌ Reload attempt {reload_attempt}/3 failed: {str(e)[:50]}"})
+                            reload_ok = False
+                            if reload_attempt < 3:
+                                await asyncio.sleep(3)
+                    if not reload_ok:
+                        await self.broadcast({"type": "status", "message": "⚠️ Reload failed - retrying context creation..."})
+                        try:
+                            self._context = await self.browser.new_context(**self._context_opts)
+                            await self._context.set_extra_http_headers({
+                                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                                "Accept-Language": "en-US,en;q=0.9",
+                                "Accept-Encoding": "gzip, deflate, br",
+                                "DNT": "1",
+                                "Connection": "keep-alive",
+                                "Upgrade-Insecure-Requests": "1",
+                            })
+                            self.page = await self._context.new_page()
+                            self.page.on("close", on_browser_disconnected)
+                            await self.page.add_init_script(_init_script)
+                            reload_ok = True
+                            await self.broadcast({"type": "status", "message": "✅ Context recovered, continuing..."})
+                        except Exception as e2:
+                            await self.broadcast({
+                                "type": "status",
+                                "message": f"❌ Cannot recover after reload failure. Try disabling 'Reload between batches' in Batch Mode. Error: {str(e2)[:60]}",
+                            })
+                            self.stop_flag = True
+                            break
+                    await asyncio.sleep(5)  # Pause to avoid looking robotic
+
+                try:
+                    total_queued = query_idx + len(query_queue)
+                    await self.broadcast({
+                        "type": "status",
+                        "message": f"--- Query {query_idx} (total in queue: {total_queued}): \"{query[:60]}{'...' if len(query) > 60 else ''}\" ---",
                     })
 
                     # Create search record in database
@@ -607,58 +617,212 @@ class AutomationManager:
 
                     query_leads = []
 
-                    # ── Cloud mode: DuckDuckGo HTTP search ──────────────────
-                    if use_headless:
-                        query_leads, cloud_count = await self._cloud_search_query(
-                            query, max_pages, delay_between_pages,
-                            target_leads, total_leads_extracted,
-                        )
-                        total_leads_extracted += cloud_count
-
+                    # ─── DuckDuckGo flow (no CAPTCHA) ─────────────────────────────────────────
+                    if search_engine == "duckduckgo":
+                        # Add filetype:pdf if not present - dramatically improves PDF results
+                        q = query.strip()
+                        if "filetype:pdf" not in q.lower() and "filetype: pdf" not in q.lower():
+                            q = f"{q} filetype:pdf"
+                        ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
+                        await self.broadcast({"type": "status", "message": f"🌐 [DuckDuckGo] Opening... (no CAPTCHA)"})
+                        await self.broadcast({"type": "status", "message": f"  🔍 Query: {q[:60]}..."})
+                        processed_urls = set()
+                        pdf_count = 0
+                        no_more_ddg_pages = False
+                        try:
+                            for ddg_page in range(1, max_pages + 1):
+                                if self.stop_flag:
+                                    break
+                                if ddg_page > 1:
+                                    await self.broadcast({"type": "status", "message": f"  📄 DDG page {ddg_page}/{max_pages}..."})
+                                    await asyncio.sleep(delay_between_pages)
+                                    # Click Next (form with class nav-link)
+                                    next_form = await self.page.query_selector("form.nav-link")
+                                    if not next_form:
+                                        no_more_ddg_pages = True
+                                        await self.broadcast({"type": "status", "message": f"  ⚠️ No more DDG pages"})
+                                        break
+                                    try:
+                                        await next_form.evaluate("form => form.submit()")
+                                        await asyncio.sleep(2)
+                                    except Exception:
+                                        break
+                                else:
+                                    # Use domcontentloaded - networkidle often never completes (DDG has persistent connections)
+                                    await self.page.goto(ddg_url, wait_until="domcontentloaded", timeout=60000)
+                                    await self.broadcast({"type": "status", "message": "  📄 Page loaded, scanning for results..."})
+                                    ss = await self.take_screenshot(force=True)
+                                    if ss:
+                                        await self.broadcast({"type": "screenshot", "data": ss})
+                                    await asyncio.sleep(5)  # Wait for results to fully render
+                                # DuckDuckGo HTML: .result = result box, .result__a or .result__url = link
+                                result_elems = await self.page.query_selector_all(".result")
+                                if not result_elems:
+                                    result_elems = await self.page.query_selector_all("article, .web-result")
+                                if ddg_page == 1:
+                                    await self.broadcast({"type": "status", "message": f"  📊 Page 1: {len(result_elems)} result boxes"})
+                                if not result_elems:
+                                    # Fallback: get ALL DDG redirect links (uddg= or /l/ path)
+                                    uddg_links = await self.page.query_selector_all("a[href*='uddg=']")
+                                    if not uddg_links:
+                                        uddg_links = await self.page.query_selector_all("a[href*='/l/']")
+                                    if uddg_links:
+                                        await self.broadcast({"type": "status", "message": f"  📊 Found {len(uddg_links)} links (fallback mode)"})
+                                        result_elems = uddg_links  # Process as link elements
+                                    else:
+                                        await self.broadcast({"type": "status", "message": "  ⚠️ No result elements found — DDG layout may have changed"})
+                                # Collect ALL links from each result (box may have title + url links)
+                                for elem in result_elems:
+                                    if self.stop_flag:
+                                        break
+                                    links_in_elem = await elem.query_selector_all("a[href*='uddg='], a[href*='/l/']")
+                                    if not links_in_elem:
+                                        link_el = await elem.query_selector(".result__a") or await elem.query_selector(".result__url")
+                                        if link_el:
+                                            links_in_elem = [link_el]
+                                    if not links_in_elem:
+                                        tag = await elem.evaluate("e => e.tagName ? e.tagName.toLowerCase() : ''")
+                                        if tag == "a":
+                                            links_in_elem = [elem]
+                                    for link_el in links_in_elem:
+                                        try:
+                                            href = await link_el.get_attribute("href")
+                                            title = (await link_el.inner_text() or "").strip() or "PDF"
+                                            if not href:
+                                                continue
+                                            # Resolve DDG redirect (uddg=encoded_url)
+                                            if "uddg=" in href or "/l/" in href:
+                                                try:
+                                                    from urllib.parse import urlparse, parse_qs, unquote
+                                                    parsed = urlparse(href if href.startswith("http") else "https://duckduckgo.com" + href)
+                                                    qs = parse_qs(parsed.query)
+                                                    if "uddg" in qs:
+                                                        href = unquote(qs["uddg"][0])
+                                                except Exception:
+                                                    pass
+                                            # Accept .pdf or .pdf?params
+                                            path_lower = (href.split("?")[0] if "?" in href else href).lower()
+                                            if href in processed_urls or not path_lower.endswith(".pdf"):
+                                                continue
+                                            processed_urls.add(href)
+                                            pdf_count += 1
+                                            display_link = urlparse(href).netloc if href.startswith("http") else ""
+                                            await self.broadcast({"type": "status", "message": f"  📄 [{pdf_count}] {title[:50]}..."})
+                                            if pdf_count % 10 == 0:  # Screenshot every 10 PDFs for Live Browser View
+                                                ss = await self.take_screenshot()
+                                                if ss:
+                                                    await self.broadcast({"type": "screenshot", "data": ss})
+                                            pdf_leads = await self.extract_from_pdf(href, title, display_link)
+                                            if pdf_leads:
+                                                for lead in pdf_leads:
+                                                    lead["search_query"] = query
+                                                query_leads.extend(pdf_leads)
+                                                total_leads_extracted += len(pdf_leads)
+                                                await self.broadcast({"type": "lead_count", "count": total_leads_extracted, "target": target_leads})
+                                                try:
+                                                    save_leads(search_id, query_leads, replace=True)
+                                                    await self.broadcast({"type": "status", "message": f"  💾 Saved ({len(query_leads)} leads)"})
+                                                except Exception:
+                                                    pass
+                                        except Exception as e:
+                                            await self.broadcast({"type": "status", "message": f"  ⚠️ Result error: {str(e)[:40]}"})
+                                            continue
+                            if not result_elems:
+                                await self.broadcast({"type": "status", "message": "⚠️ No DuckDuckGo results found"})
+                        except Exception as e:
+                            await self.broadcast({"type": "status", "message": f"❌ DuckDuckGo error: {str(e)[:60]}"})
+                            continue
+                        # DDG done - finalize this query here and skip Google flow.
+                        # This prevents accidental fallback to Google/CAPTCHA when DDG is selected.
                         if query_leads:
                             all_leads.extend(query_leads)
                             self.all_leads_buffer.extend(query_leads)
-                            await self.broadcast({"type": "lead_count", "count": total_leads_extracted, "target": target_leads})
-                            try:
-                                saved_count = save_leads(search_id, query_leads)
-                                await self.broadcast({"type": "status", "message": f"💾 Saved {saved_count} leads to database (session #{search_id})"})
-                            except Exception as e:
-                                await self.broadcast({"type": "status", "message": f"⚠️ DB save error: {str(e)[:60]}"})
-                            await self.broadcast({"type": "leads", "data": query_leads})
-                            await self.broadcast({"type": "status", "message": f"✅ Query {query_idx + 1}: {len(query_leads)} leads | Total: {total_leads_extracted}"})
-                        else:
-                            await self.broadcast({"type": "status", "message": f"⚠️ Query {query_idx + 1}: No leads extracted"})
-                        await self.broadcast({"type": "status", "message": ""})
-                        continue  # Skip Google path below
-
-                    # ── Desktop mode: Google Playwright search ──────────────
-                    # STEP 1: Navigate to Google (retry up to 3 times so first page does not quit the run)
-                    step1_ok = False
-                    for step1_attempt in range(1, 4):
-                        if self.stop_flag:
-                            break
-                        await self.broadcast({"type": "status", "message": f"🌐 [STEP 1] Opening Google... (attempt {step1_attempt}/3)"})
-                        try:
-                            await self.page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
-                            await self.page.wait_for_load_state("networkidle", timeout=30000)
-                            if "google.com" not in self.page.url.lower():
-                                raise Exception(f"Navigation failed - URL is {self.page.url}")
-                            await self.broadcast({"type": "status", "message": "✅ [STEP 1] Successfully navigated to Google"})
-                            screenshot = await self.take_screenshot(force=True)
-                            if screenshot:
-                                await self.broadcast({"type": "screenshot", "data": screenshot})
-                            step1_ok = True
-                            break
-                        except Exception as e:
                             await self.broadcast({
                                 "type": "status",
-                                "message": f"⚠️ [STEP 1] Attempt {step1_attempt}/3 failed: {str(e)[:50]}",
+                                "message": f"✅ Query {query_idx} complete (DuckDuckGo): {len(query_leads)} leads",
                             })
-                            if step1_attempt < 3:
-                                await asyncio.sleep(3)  # Brief pause before retry
-                    if not step1_ok:
-                        await self.broadcast({"type": "status", "message": "❌ [STEP 1] Could not load Google after 3 attempts. Skipping query."})
+                            if target_leads > 0 and total_leads_extracted >= target_leads:
+                                await self.broadcast({
+                                    "type": "status",
+                                    "message": f"🎯 Target reached! Extracted {total_leads_extracted} leads (target: {target_leads}). Stopping...",
+                                })
+                                self.stop_flag = True
+                        else:
+                            await self.broadcast({
+                                "type": "status",
+                                "message": f"⚠️ Query {query_idx}: No leads extracted from DuckDuckGo",
+                            })
+                        # When DDG runs out of pages, add query variations if:
+                        # - User set a target and we're under it, OR
+                        # - Target is 0: always add variations (run until no more pages, no artificial cap)
+                        should_add_variations = no_more_ddg_pages and variation_idx < len(DDG_QUERY_VARIATIONS)
+                        under_target = target_leads > 0 and total_leads_extracted < target_leads
+                        no_limit_mode = target_leads == 0  # Target 0 = no cap, keep going
+                        max_auto_variations = 5
+                        if should_add_variations and (under_target or no_limit_mode) and variation_idx < max_auto_variations:
+                            base = q.replace(" filetype:pdf", "").replace(" filetype: pdf", "").strip()
+                            new_q = base + DDG_QUERY_VARIATIONS[variation_idx] + " filetype:pdf"
+                            variation_idx += 1
+                            query_queue.append(new_q)
+                            reason = f"reach {target_leads} leads" if target_leads > 0 else "get more leads (got few results)"
+                            await self.broadcast({
+                                "type": "status",
+                                "message": f"  🔄 DDG exhausted pages — adding variation to {reason}: \"{new_q[:55]}...\"",
+                            })
+                        await self.broadcast({"type": "leads", "data": query_leads})
                         continue
+                    else:
+                        # ─── Google flow ────────────────────────────────────────────────────────
+                        # STEP 1: Navigate to Google (retry up to 3 times so first page does not quit the run)
+                        step1_ok = False
+                        for step1_attempt in range(1, 4):
+                            if self.stop_flag:
+                                break
+                            await self.broadcast({"type": "status", "message": f"🌐 [STEP 1] Opening Google... (attempt {step1_attempt}/3)"})
+                            try:
+                                await self.page.goto("https://www.google.com", wait_until="domcontentloaded", timeout=30000)
+                                await asyncio.sleep(2)
+                                await self.page.wait_for_load_state("networkidle", timeout=30000)
+                                if "google.com" not in self.page.url.lower():
+                                    raise Exception(f"Navigation failed - URL is {self.page.url}")
+                                await self.broadcast({"type": "status", "message": "✅ [STEP 1] Successfully navigated to Google"})
+                                screenshot = await self.take_screenshot(force=True)
+                                if screenshot:
+                                    await self.broadcast({"type": "screenshot", "data": screenshot})
+                                step1_ok = True
+                                break
+                            except Exception as e:
+                                await self.broadcast({
+                                    "type": "status",
+                                    "message": f"⚠️ [STEP 1] Attempt {step1_attempt}/3 failed: {str(e)[:50]}",
+                                })
+                                if step1_attempt < 3:
+                                    await asyncio.sleep(3)  # Brief pause before retry
+                        if not step1_ok:
+                            await self.broadcast({"type": "status", "message": "❌ [STEP 1] Could not load Google after 3 attempts. Skipping query."})
+                            continue
+
+                    # Check for Google CAPTCHA/sorry page ("unusual traffic") - wait for user to solve
+                    current_url = self.page.url.lower()
+                    page_content = (await self.page.content()).lower()
+                    if "sorry" in current_url or "recaptcha" in current_url or "unusual traffic" in page_content:
+                        await self.broadcast({
+                            "type": "status",
+                            "message": "⚠️ Google CAPTCHA detected! Please solve the 'I'm not a robot' checkbox in the browser. Waiting up to 60 seconds...",
+                        })
+                        for wait_sec in range(60, 0, -5):
+                            if self.stop_flag:
+                                break
+                            await asyncio.sleep(5)
+                            url_now = self.page.url.lower()
+                            if "sorry" not in url_now and "recaptcha" not in url_now:
+                                await self.broadcast({"type": "status", "message": "✅ CAPTCHA solved! Continuing..."})
+                                break
+                        else:
+                            await self.broadcast({"type": "status", "message": "❌ CAPTCHA not solved in time. Try DuckDuckGo (Settings → Search Engine) to avoid this."})
+                            continue
+
+                    await asyncio.sleep(delay_between_actions)
 
                     # Accept cookies if present
                     try:
@@ -670,16 +834,22 @@ class AutomationManager:
                     except Exception:
                         pass
 
-                    # STEP 2: Enter search query (instant fill)
-                    await self.broadcast({"type": "status", "message": f"⌨️ [STEP 2] Typing: \"{query}\""})
+                    # STEP 2: Paste search query (instant - more reliable than typing)
+                    await self.broadcast({"type": "status", "message": f"⌨️ [STEP 2] Pasting: \"{query[:50]}...\""})
                     try:
                         search_box = await self.page.wait_for_selector('textarea[name="q"], input[name="q"]', timeout=10000)
                         if not search_box:
                             raise Exception("Search box element not found")
                         await search_box.click()
-                        await search_box.fill(query)
-                        await asyncio.sleep(0.3)
-                        await self.broadcast({"type": "status", "message": "✅ [STEP 2] Query entered successfully"})
+                        await asyncio.sleep(0.2)
+                        await search_box.fill("")  # Clear first
+                        await search_box.fill(query)  # Instant paste - fast and reliable
+                        await asyncio.sleep(0.2)
+                        
+                        input_value = await search_box.input_value()
+                        if input_value != query:
+                            raise Exception(f"Input validation failed - expected '{query}', got '{input_value}'")
+                        await self.broadcast({"type": "status", "message": "✅ [STEP 2] Query typed successfully"})
                         screenshot = await self.take_screenshot(force=True)
                         if screenshot:
                             await self.broadcast({"type": "screenshot", "data": screenshot})
@@ -703,6 +873,7 @@ class AutomationManager:
                             await asyncio.sleep(10)  # Wait for manual solve or auto-solve
                         
                         await self.page.keyboard.press("Enter")
+                        await asyncio.sleep(1)  # Human-like pause
                         
                         # Wait for URL to change to search page
                         try:
@@ -724,6 +895,7 @@ class AutomationManager:
                             pass  # URL might not change, continue anyway
                         
                         await self.page.wait_for_load_state("networkidle", timeout=30000)
+                        await asyncio.sleep(3)  # Give results time to render
                         
                         # Check again for reCAPTCHA on results page
                         recaptcha_check = await self.page.query_selector("iframe[src*='recaptcha'], div[class*='recaptcha']")
@@ -878,72 +1050,191 @@ class AutomationManager:
                                     cite_elem = await elem.query_selector("cite")
                                     display_link = await cite_elem.inner_text() if cite_elem else url.split("/")[2] if "/" in url else ""
 
+                                    # STEP 5: Since query has filetype:pdf, ALL results should be PDFs - CLICK THEM ALL
                                     pdf_count += 1
                                     await self.broadcast({
                                         "type": "status",
-                                        "message": f"  📄 [{pdf_count}] {title[:55]}",
+                                        "message": f"  📄 [STEP 5.{pdf_count}] Processing result #{pdf_count}: {title[:50]}",
                                     })
-
+                                    
+                                    # STEP 6: CLICK THIS RESULT IMMEDIATELY (process now!)
                                     try:
-                                        # Navigate directly to URL (faster + more reliable than clicking)
-                                        await self.page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                                        await self.broadcast({
+                                            "type": "status",
+                                            "message": f"  🖱️ [STEP 6.{pdf_count}] Clicking result #{pdf_count}...",
+                                        })
+                                        
+                                        # Scroll into view FIRST
+                                        await link_elem.scroll_into_view_if_needed()
+                                        await asyncio.sleep(0.5)
+                                        
+                                        # Get current URL before click
+                                        current_url_before = self.page.url
+                                        
+                                        # Click the title (most reliable)
+                                        await self.broadcast({
+                                            "type": "status",
+                                            "message": f"  🖱️ Clicking title: {title[:40]}...",
+                                        })
+                                        
                                         try:
-                                            await self.page.wait_for_load_state("networkidle", timeout=15000)
-                                        except Exception:
-                                            pass  # page loaded enough
-
+                                            await title_elem.click(timeout=5000)
+                                            await self.broadcast({
+                                                "type": "status",
+                                                "message": f"  ✅ Clicked title element",
+                                            })
+                                        except Exception as click_err:
+                                            # Fallback to link element
+                                            await self.broadcast({
+                                                "type": "status",
+                                                "message": f"  ⚠️ Title click failed, trying link: {str(click_err)[:40]}",
+                                            })
+                                            try:
+                                                await link_elem.click(timeout=5000)
+                                                await self.broadcast({
+                                                    "type": "status",
+                                                    "message": f"  ✅ Clicked link element",
+                                                })
+                                            except Exception as link_err:
+                                                # Final fallback: use JavaScript click
+                                                await self.broadcast({
+                                                    "type": "status",
+                                                    "message": f"  ⚠️ Link click failed, using JS click: {str(link_err)[:40]}",
+                                                })
+                                                await self.page.evaluate("""
+                                                    (element) => {
+                                                        element.click();
+                                                    }
+                                                """, link_elem)
+                                                await self.broadcast({
+                                                    "type": "status",
+                                                    "message": f"  ✅ Clicked via JavaScript",
+                                                })
+                                        
+                                        await asyncio.sleep(2)  # Wait for navigation
+                                        
                                         screenshot = await self.take_screenshot(force=True)
                                         if screenshot:
                                             await self.broadcast({"type": "screenshot", "data": screenshot})
-
-                                        pdf_leads = await self.extract_from_pdf(url, title, display_link)
-
+                                        
+                                        # Verify navigation happened
+                                        await asyncio.sleep(1)
+                                        current_url_after = self.page.url
+                                        
+                                        if current_url_after == current_url_before:
+                                            await self.broadcast({
+                                                "type": "status",
+                                                "message": f"  ⚠️ Click did not navigate! Trying direct navigation to: {url[:60]}...",
+                                            })
+                                            # Fallback: Navigate directly to URL
+                                            try:
+                                                await self.page.goto(url, wait_until="networkidle", timeout=30000)
+                                                await self.broadcast({
+                                                    "type": "status",
+                                                    "message": f"  ✅ Navigated directly",
+                                                })
+                                            except Exception as nav_error:
+                                                await self.broadcast({
+                                                    "type": "status",
+                                                    "message": f"  ❌ Direct navigation failed: {str(nav_error)[:60]}. Skipping...",
+                                                })
+                                                # Go back to search results before continuing
+                                                try:
+                                                    await self.page.go_back()
+                                                    await self.page.wait_for_load_state("networkidle", timeout=10000)
+                                                except Exception:
+                                                    await self.page.goto(f"https://www.google.com/search?q={quote_plus(query)}", wait_until="networkidle", timeout=15000)
+                                                continue  # Skip this result
+                                        else:
+                                            await self.broadcast({
+                                                "type": "status",
+                                                "message": f"  ✅ Navigation successful! URL changed to: {current_url_after[:60]}",
+                                            })
+                                        
+                                        # PDFs: Skip networkidle - browser PDF viewer often never reaches it (keeps loading thumbnails).
+                                        # extract_from_pdf downloads via httpx, so we don't need the page. Brief wait then proceed.
+                                        is_pdf = url.lower().endswith(".pdf") or "/pdf" in url.lower()
+                                        if is_pdf:
+                                            await asyncio.sleep(2)  # Brief pause, then extract (httpx downloads independently)
+                                        else:
+                                            try:
+                                                await self.page.wait_for_load_state("networkidle", timeout=15000)
+                                                await asyncio.sleep(2)
+                                            except Exception:
+                                                await asyncio.sleep(3)
+                                        screenshot = await self.take_screenshot(force=True)
+                                        if screenshot:
+                                            await self.broadcast({"type": "screenshot", "data": screenshot})
+                                        
+                                        # STEP 7: Extract leads from PDF/page
+                                        await self.broadcast({
+                                            "type": "status",
+                                            "message": f"  📥 [STEP 7.{pdf_count}] Extracting leads from result #{pdf_count}...",
+                                        })
+                                        
+                                        pdf_leads = await self.extract_from_pdf(
+                                            url,
+                                            title,
+                                            display_link,
+                                        )
+                                        
                                         if pdf_leads:
                                             for lead in pdf_leads:
                                                 lead["search_query"] = query
                                             query_leads.extend(pdf_leads)
                                             total_leads_extracted += len(pdf_leads)
-                                            await self.broadcast({"type": "lead_count", "count": total_leads_extracted, "target": target_leads})
+                                            # Broadcast real-time update after each PDF
+                                            await self.broadcast({
+                                                "type": "lead_count",
+                                                "count": total_leads_extracted,
+                                                "target": target_leads,
+                                            })
                                             await self.broadcast({
                                                 "type": "status",
-                                                "message": f"  ✅ [{pdf_count}] {len(pdf_leads)} leads extracted | Total: {total_leads_extracted}",
+                                                "message": f"  ✅ [STEP 7.{pdf_count}] Extracted {len(pdf_leads)} leads | Total: {total_leads_extracted} leads",
                                             })
-
-                                            if target_leads > 0 and total_leads_extracted >= target_leads:
-                                                await self.broadcast({
-                                                    "type": "status",
-                                                    "message": f"🎯 Target reached! {total_leads_extracted} leads. Stopping...",
-                                                })
-                                                self.stop_flag = True
-                                                break
+                                            
+                                            # Save immediately after each PDF (resilient - never lose leads)
+                                            try:
+                                                save_leads(search_id, query_leads, replace=True)
+                                                await self.broadcast({"type": "status", "message": f"  💾 Saved to DB ({len(query_leads)} total for this query)"})
+                                            except Exception as es:
+                                                await self.broadcast({"type": "status", "message": f"  ⚠️ Save error: {str(es)[:40]}"})
                                         else:
                                             await self.broadcast({
                                                 "type": "status",
-                                                "message": f"  ⚠️ [{pdf_count}] No leads on this page",
+                                                "message": f"  ⚠️ [STEP 7.{pdf_count}] No leads extracted",
                                             })
-
-                                        # Return to Google results
-                                        await self.page.goto(
-                                            f"https://www.google.com/search?q={quote_plus(query)}&start={(page_num - 1) * 10}",
-                                            wait_until="domcontentloaded", timeout=20000,
-                                        )
-                                        try:
-                                            await self.page.wait_for_load_state("networkidle", timeout=10000)
-                                        except Exception:
-                                            pass
-
-                                    except Exception as e:
+                                        
+                                        # STEP 8: Go back to search results
                                         await self.broadcast({
                                             "type": "status",
-                                            "message": f"  ❌ [{pdf_count}] Error: {str(e)[:80]}",
+                                            "message": f"  ⬅️ [STEP 8.{pdf_count}] Returning to search results...",
                                         })
                                         try:
-                                            await self.page.goto(
-                                                f"https://www.google.com/search?q={quote_plus(query)}&start={(page_num - 1) * 10}",
-                                                wait_until="domcontentloaded", timeout=15000,
-                                            )
+                                            await self.page.go_back()
+                                            await self.page.wait_for_load_state("networkidle", timeout=15000)
+                                            await asyncio.sleep(1)
+                                            screenshot = await self.take_screenshot(force=True)
+                                            if screenshot:
+                                                await self.broadcast({"type": "screenshot", "data": screenshot})
                                         except Exception:
-                                            pass
+                                            # If back fails, navigate to Google search again
+                                            await self.page.goto(f"https://www.google.com/search?q={quote_plus(query)}", wait_until="networkidle", timeout=15000)
+                                        
+                                    except Exception as e:
+                                        import traceback
+                                        error_trace = traceback.format_exc()
+                                        await self.broadcast({
+                                            "type": "status",
+                                            "message": f"  ❌ Result #{pdf_count} error: {str(e)[:80]}",
+                                        })
+                                        # Try to get back to search results
+                                        try:
+                                            await self.page.go_back()
+                                            await self.page.wait_for_load_state("networkidle", timeout=10000)
+                                        except Exception:
+                                            await self.page.goto(f"https://www.google.com/search?q={quote_plus(query)}", wait_until="networkidle", timeout=15000)
 
                                 except Exception:
                                     continue
@@ -1063,11 +1354,12 @@ class AutomationManager:
                     })
                     # Log full error for debugging
                     print(f"Query {query_idx + 1} error: {error_trace}")
-                    # Save any leads we got before the error
+                    # Save any leads we got before the error (replace=True - full replace for this search)
                     if 'query_leads' in locals() and query_leads and 'search_id' in locals() and search_id:
                         try:
-                            save_leads(search_id, query_leads)
+                            save_leads(search_id, query_leads, replace=True)
                             all_leads.extend(query_leads)
+                            self.all_leads_buffer.extend(query_leads)
                         except Exception:
                             pass
                     continue
@@ -1125,12 +1417,21 @@ class AutomationManager:
             await self.broadcast({"type": "complete", "data": all_leads})
 
         except Exception as e:
+            import traceback
+            print(f"[Automation] ERROR: {e}", file=sys.stderr, flush=True)
+            traceback.print_exc()
             error_msg = str(e)
             await self.broadcast({
                 "type": "error",
                 "message": f"❌ Automation error: {error_msg}",
             })
-            # Save buffer on error
+            # CRITICAL: Save buffer to DB and PDF on error (never lose leads)
+            if self.all_leads_buffer and self.current_session_id:
+                try:
+                    save_leads(self.current_session_id, self.all_leads_buffer, replace=True)
+                    await self.broadcast({"type": "status", "message": f"💾 Saved {len(self.all_leads_buffer)} leads to database (recovery)"})
+                except Exception:
+                    pass
             if self.all_leads_buffer:
                 try:
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1158,7 +1459,7 @@ class AutomationManager:
                         "type": "status",
                         "message": f"💾 Saving {len(final_leads)} leads before closing...",
                     })
-                    save_leads(self.current_session_id, final_leads)
+                    save_leads(self.current_session_id, final_leads, replace=True)
                     await self.broadcast({
                         "type": "status",
                         "message": f"✅ Saved to database (session #{self.current_session_id})",
@@ -1176,6 +1477,11 @@ class AutomationManager:
                     await self.page.close()
             except Exception as e:
                 cleanup_errors.append(f"Page close: {str(e)[:30]}")
+            try:
+                if getattr(self, '_persistent_context', None):
+                    await self._persistent_context.close()
+            except Exception as e:
+                cleanup_errors.append(f"Context close: {str(e)[:30]}")
             try:
                 if self.browser:
                     await self.browser.close()
@@ -1248,6 +1554,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 command = data.get("command")
 
                 if command == "start":
+                    headless_val = bool(data.get("headless", False))
+                    print(f"[Automation] START received: headless={headless_val}, queries={len(data.get('queries', []))}", file=sys.stderr, flush=True)
                     if manager.is_running:
                         await websocket.send_json({
                             "type": "error",
@@ -1260,6 +1568,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     delay_pages = data.get("delay_pages", 3.0)
                     delay_actions = data.get("delay_actions", 1.0)
                     target_leads = data.get("target_leads", 0)
+                    raw = data.get("search_engine", "duckduckgo")
+                    search_engine = str(raw).lower().strip() if raw else "duckduckgo"
+                    if search_engine not in ("duckduckgo", "google"):
+                        search_engine = "duckduckgo"
+                    headless = bool(data.get("headless", False))
+                    reload_between_queries = bool(data.get("reload_between_queries", False))
 
                     # Run automation in background
                     asyncio.create_task(manager.run_automation(
@@ -1268,6 +1582,9 @@ async def websocket_endpoint(websocket: WebSocket):
                         delay_between_pages=delay_pages,
                         delay_between_actions=delay_actions,
                         target_leads=target_leads,
+                        search_engine=search_engine,
+                        headless=headless,
+                        reload_between_queries=reload_between_queries,
                     ))
 
                 elif command == "stop":
@@ -1309,13 +1626,19 @@ async def websocket_endpoint(websocket: WebSocket):
                     break
 
     except WebSocketDisconnect:
-        # Save buffer on disconnect
+        # CRITICAL: Save to database AND PDF on disconnect (client closed tab / refreshed)
+        if manager.all_leads_buffer and manager.current_session_id:
+            try:
+                save_leads(manager.current_session_id, manager.all_leads_buffer, replace=True)
+                print(f"💾 Saved {len(manager.all_leads_buffer)} leads to DB on disconnect")
+            except Exception as e:
+                print(f"⚠️ DB save on disconnect failed: {e}")
         if manager.all_leads_buffer:
             try:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"leads_disconnect_{timestamp}.pdf"
                 filepath = export_to_pdf(manager.all_leads_buffer, query="Disconnected Leads", filename=filename)
-                print(f"💾 Saved leads on disconnect: {filepath}")
+                print(f"💾 Saved leads to PDF on disconnect: {filepath}")
             except Exception:
                 pass
         manager.disconnect(websocket)
@@ -1324,7 +1647,7 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(websocket)
 
 
-@app.api_route("/", methods=["GET", "HEAD"])
+@app.get("/")
 async def root():
     return {"status": "Automation server running", "websocket": "/ws"}
 

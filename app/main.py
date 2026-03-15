@@ -10,16 +10,22 @@ import json
 import threading
 import time
 import websocket
+from queue import Queue, Empty
+from datetime import datetime
 from typing import List
-from streamlit_autorefresh import st_autorefresh
 
-from app.config import APP_NAME, APP_VERSION, LICENSE_KEY, LICENSE_SECRET, EXPORT_DIR, WEBSOCKET_URL, AUTOMATION_SERVER_URL
+# Thread-safe ref for WebSocket (Stop button). Session state must NOT be touched from WS thread.
+_ws_client_ref = [None]
+
+from email_validator import validate_email, EmailNotValidError
+
+from app.config import APP_NAME, APP_VERSION, LICENSE_KEY, LICENSE_SECRET, EXPORT_DIR, WEBSOCKET_URL, AUTOMATION_SERVER_URL, PROJECT_ROOT
 from app.license.validator import validate_license
 from app.license.activation_ui import check_license, show_activation_dialog, show_license_status
 from app.database.db import get_all_leads, get_lead_stats
 from app.export.exporter import export_to_csv, export_to_excel, COLUMN_PRESETS, leads_to_dataframe
 from app.export.pdf_exporter import export_to_pdf
-from app.config_manager import load_settings
+from app.config_manager import load_settings, save_settings
 from app.email.email_ui import render_email_sender_page
 
 
@@ -128,27 +134,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ─── Thread-safe shared data (background thread writes here, main thread reads) ─
-import threading
-
-if "ws_data" not in st.session_state:
-    st.session_state.ws_data = {
-        "activity_log": [],
-        "extracted_leads": [],
-        "current_screenshot": None,
-        "is_running": False,
-        "needs_refresh": False,
-        "current_lead_count": 0,
-        "target_lead_count": 0,
-        "saved_files": [],
-        "last_update": 0,
-    }
-    st.session_state.ws_lock = threading.Lock()
-
-# Convenience ref
-_ws = st.session_state.ws_data
-_ws_lock = st.session_state.ws_lock
-
 # ─── Session State ───────────────────────────────────────────────────────────
 if "activity_log" not in st.session_state:
     st.session_state.activity_log = []
@@ -176,99 +161,58 @@ if "server_checked" not in st.session_state:
     st.session_state.server_checked = False
 if "current_page" not in st.session_state:
     st.session_state.current_page = "🔍 Live Extractor"
+if "search_engine" not in st.session_state:
+    st.session_state.search_engine = st.session_state.settings.get("search_engine", "duckduckgo")
 
 
 # ─── WebSocket Client (URL from app.config, supports local + cloud) ───────────
+# CRITICAL: WebSocket callbacks run in a background thread. They must NOT touch
+# st.session_state directly - that causes "missing ScriptRunContext" and connection drops.
+# Instead, put updates in a queue; main thread drains it and updates session state.
 
 
 def websocket_client(queries: List[str], max_pages: int, delay_pages: float, delay_actions: float,
-                     ws_data: dict, ws_lock: threading.Lock, target_leads: int = 0):
-    """Connect to WebSocket server and handle messages (runs in background thread).
-    Writes to ws_data dict (NOT st.session_state) to avoid ScriptRunContext errors.
-    """
-    _last_screenshot_time = [0.0]
-
+                    msg_queue: Queue, target_leads: int, search_engine: str, headless: bool,
+                    batch_reload: bool = False):
+    """Connect to WebSocket server. Callbacks put updates in msg_queue (no session state)."""
     def on_message(ws, message):
         try:
             data = json.loads(message)
             msg_type = data.get("type")
-
-            with ws_lock:
-                if msg_type == "status":
-                    ws_data["activity_log"].append(data.get("message", ""))
-                    if len(ws_data["activity_log"]) > 200:
-                        ws_data["activity_log"] = ws_data["activity_log"][-200:]
-                    ws_data["needs_refresh"] = True
-
-                elif msg_type == "screenshot":
-                    screenshot_data = data.get("data", "")
-                    if screenshot_data:
-                        now = time.time()
-                        if (now - _last_screenshot_time[0]) >= 1.0:
-                            ws_data["current_screenshot"] = screenshot_data
-                            _last_screenshot_time[0] = now
-                            ws_data["needs_refresh"] = True
-
-                elif msg_type == "ping":
-                    pass
-
-                elif msg_type == "leads":
-                    ws_data["extracted_leads"].extend(data.get("data", []))
-                    ws_data["current_lead_count"] = len(ws_data["extracted_leads"])
-                    ws_data["needs_refresh"] = True
-
-                elif msg_type == "lead_count":
-                    ws_data["current_lead_count"] = data.get("count", 0)
-                    ws_data["target_lead_count"] = data.get("target", 0)
-                    ws_data["needs_refresh"] = True
-
-                elif msg_type == "file_saved":
-                    ws_data["saved_files"].append({
-                        "path": data.get("path", ""),
-                        "query": data.get("query", ""),
-                        "count": data.get("count", 0),
-                        "timestamp": datetime.now().strftime("%H:%M:%S"),
-                    })
-                    ws_data["needs_refresh"] = True
-
-                elif msg_type == "complete":
-                    all_leads = data.get("data", [])
-                    if all_leads:
-                        ws_data["extracted_leads"] = all_leads
-                    ws_data["activity_log"].append("🎉 Automation completed!")
-                    ws_data["is_running"] = False
-                    ws_data["needs_refresh"] = True
-                    time.sleep(1)
-                    try:
-                        ws.close()
-                    except Exception:
-                        pass
-
-                elif msg_type == "error":
-                    error_msg = data.get("message", "")
-                    ws_data["activity_log"].append(error_msg)
-                    if "fatal" in error_msg.lower() or "crash" in error_msg.lower():
-                        ws_data["is_running"] = False
-                        ws.close()
-                    else:
-                        ws_data["needs_refresh"] = True
-
+            if msg_type == "status":
+                msg_queue.put(("status", data.get("message", "")))
+            elif msg_type == "screenshot":
+                msg_queue.put(("screenshot", data.get("data", "")))
+            elif msg_type == "ping":
+                pass
+            elif msg_type == "leads":
+                msg_queue.put(("leads", data.get("data", [])))
+            elif msg_type == "lead_count":
+                msg_queue.put(("lead_count", (data.get("count", 0), data.get("target", 0))))
+            elif msg_type == "file_saved":
+                msg_queue.put(("file_saved", {
+                    "path": data.get("path", ""),
+                    "query": data.get("query", ""),
+                    "count": data.get("count", 0),
+                    "timestamp": datetime.now().strftime("%H:%M:%S"),
+                }))
+            elif msg_type == "complete":
+                msg_queue.put(("complete", data.get("data", [])))
+            elif msg_type == "error":
+                msg_queue.put(("error", data.get("message", "")))
         except Exception as e:
-            with ws_lock:
-                ws_data["activity_log"].append(f"❌ Error: {str(e)}")
+            msg_queue.put(("status", f"❌ Error: {str(e)}"))
 
     def on_error(ws, error):
-        with ws_lock:
-            ws_data["activity_log"].append(f"❌ WebSocket error: {str(error)}")
-            ws_data["is_running"] = False
+        msg_queue.put(("error", str(error)))
+        msg_queue.put(("closed", None))
 
     def on_close(ws, close_status_code, close_msg):
-        with ws_lock:
-            ws_data["is_running"] = False
+        msg_queue.put(("closed", None))
 
     def on_open(ws):
-        with ws_lock:
-            ws_data["is_running"] = True
+        _ws_client_ref[0] = ws
+        msg_queue.put(("connected", None))
         ws.send(json.dumps({
             "command": "start",
             "queries": queries,
@@ -276,23 +220,100 @@ def websocket_client(queries: List[str], max_pages: int, delay_pages: float, del
             "delay_pages": delay_pages,
             "delay_actions": delay_actions,
             "target_leads": target_leads,
+            "search_engine": search_engine,
+            "headless": headless,
+            "reload_between_queries": batch_reload,
         }))
 
     try:
-        ws_app = websocket.WebSocketApp(
+        _ws_client_ref[0] = None
+        ws = websocket.WebSocketApp(
             WEBSOCKET_URL,
             on_message=on_message,
             on_error=on_error,
             on_close=on_close,
             on_open=on_open,
         )
-        with ws_lock:
-            ws_data["ws_client"] = ws_app
-        ws_app.run_forever()
+        ws.run_forever()
     except Exception as e:
-        with ws_lock:
-            ws_data["activity_log"].append(f"❌ Connection error: {str(e)}")
-            ws_data["is_running"] = False
+        msg_queue.put(("error", str(e)))
+        msg_queue.put(("closed", None))
+    finally:
+        msg_queue.put(("closed", None))  # Ensure UI updates when thread exits
+        _ws_client_ref[0] = None
+
+
+def run_websocket_client(queries: List[str], max_pages: int, delay_pages: float, delay_actions: float,
+                        msg_queue: Queue, target_leads: int, search_engine: str, headless: bool,
+                        batch_reload: bool = False):
+    """Run WebSocket client in background thread."""
+    websocket_client(queries, max_pages, delay_pages, delay_actions, msg_queue, target_leads, search_engine, headless, batch_reload)
+
+
+def drain_ws_queue(msg_queue: Queue) -> bool:
+    """Process queued WebSocket updates on main thread. Returns True if needs rerun."""
+    if msg_queue is None:
+        return False
+    changed = False
+    while True:
+        try:
+            item = msg_queue.get_nowait()
+        except Empty:
+            break
+        msg_type, data = item
+        if msg_type == "status":
+            st.session_state.activity_log.append(data)
+            if len(st.session_state.activity_log) > 200:
+                st.session_state.activity_log = st.session_state.activity_log[-200:]
+            changed = True
+        elif msg_type == "screenshot" and data:
+            if not hasattr(st.session_state, 'last_screenshot_update'):
+                st.session_state.last_screenshot_update = 0
+            now = time.time()
+            if (now - st.session_state.last_screenshot_update) >= 0.5:  # Update every 0.5s for responsive Live View
+                st.session_state.current_screenshot = data
+                st.session_state.last_screenshot_update = now
+                st.session_state.needs_refresh = True
+                st.session_state.last_update = now
+                changed = True
+        elif msg_type == "leads":
+            st.session_state.extracted_leads.extend(data)
+            st.session_state.current_lead_count = len(st.session_state.extracted_leads)
+            st.session_state.needs_refresh = True
+            st.session_state.last_update = time.time()
+            changed = True
+        elif msg_type == "lead_count":
+            st.session_state.current_lead_count, st.session_state.target_lead_count = data
+            st.session_state.needs_refresh = True
+            st.session_state.last_update = time.time()
+            changed = True
+        elif msg_type == "file_saved":
+            st.session_state.saved_files.append(data)
+            st.session_state.activity_log.append(f"💾 File saved: {data['path']} ({data['count']} leads)")
+            changed = True
+        elif msg_type == "complete":
+            if data:
+                st.session_state.extracted_leads = data
+            st.session_state.activity_log.append("🎉 Automation completed!")
+            st.session_state.is_running = False
+            st.session_state.needs_refresh = True
+            st.session_state.last_update = time.time()
+            changed = True
+        elif msg_type == "error":
+            st.session_state.activity_log.append(f"❌ {data}")
+            if "fatal" in str(data).lower() or "crash" in str(data).lower():
+                st.session_state.is_running = False
+            st.session_state.needs_refresh = True
+            changed = True
+        elif msg_type == "connected":
+            st.session_state.websocket_connected = True
+            st.session_state.activity_log.append("✅ Connected — automation starting...")
+            changed = True
+        elif msg_type == "closed":
+            st.session_state.websocket_connected = False
+            st.session_state.is_running = False
+            changed = True
+    return changed
 
 
 # ─── License Check ───────────────────────────────────────────────────────────
@@ -319,6 +340,20 @@ def render_sidebar():
         st.divider()
 
         st.markdown("### ⚙️ Engine")
+        # Search Engine - always visible in sidebar (avoids CAPTCHA)
+        if "search_engine" not in st.session_state:
+            st.session_state.search_engine = "duckduckgo"
+        search_engine = st.selectbox(
+            "Search Engine",
+            ["duckduckgo", "google"],
+            format_func=lambda x: "🦆 DuckDuckGo (no CAPTCHA)" if x == "duckduckgo" else "🔍 Google",
+            index=0 if st.session_state.search_engine == "duckduckgo" else 1,
+            key="sidebar_search_engine",
+            help="DuckDuckGo recommended - no CAPTCHA. Google may block on repeat runs.",
+        )
+        st.session_state.search_engine = search_engine
+        if search_engine == "google":
+            st.caption("⚠️ Google may show CAPTCHA")
         # Check server status
         if not st.session_state.server_checked:
             try:
@@ -388,33 +423,15 @@ def render_bottom_navigation():
 
 
 # ─── Main Extractor Page ─────────────────────────────────────────────────────
-def _sync_ws_data():
-    """Copy data from thread-safe ws_data dict into session_state for rendering."""
-    _ws = st.session_state.ws_data
-    _lock = st.session_state.ws_lock
-    with _lock:
-        if _ws["activity_log"]:
-            st.session_state.activity_log = list(_ws["activity_log"])
-        if _ws["extracted_leads"]:
-            st.session_state.extracted_leads = list(_ws["extracted_leads"])
-        if _ws["current_screenshot"]:
-            st.session_state.current_screenshot = _ws["current_screenshot"]
-        st.session_state.current_lead_count = _ws["current_lead_count"]
-        st.session_state.target_lead_count = _ws["target_lead_count"]
-        if _ws["saved_files"]:
-            st.session_state.saved_files = list(_ws["saved_files"])
-        if not _ws["is_running"] and st.session_state.is_running:
-            st.session_state.is_running = False
-        st.session_state.needs_refresh = _ws["needs_refresh"]
-        _ws["needs_refresh"] = False
-
-
 def render_extractor_page():
-    # Sync thread data into session state on every render
-    _sync_ws_data()
-
+    # Drain WebSocket queue FIRST (thread-safe: WS callbacks put here, we apply on main thread)
+    q = st.session_state.get("ws_message_queue")
+    if drain_ws_queue(q):
+        st.rerun()
     st.markdown('<p class="app-title">🎯 Live Browser Automation</p>', unsafe_allow_html=True)
-    st.markdown('<p class="app-subtitle">Watch the browser automate Google searches in real-time</p>', unsafe_allow_html=True)
+    engine = st.session_state.get("search_engine", "duckduckgo")
+    subtitle = "Watch the browser automate DuckDuckGo searches in real-time (no CAPTCHA)" if engine == "duckduckgo" else "Watch the browser automate Google searches (may show CAPTCHA)"
+    st.markdown(f'<p class="app-subtitle">{subtitle}</p>', unsafe_allow_html=True)
 
     # ── Query Input ─────────────────────────────────────────────────────────
     st.markdown("### 🔍 Search Queries")
@@ -428,11 +445,40 @@ def render_extractor_page():
     # ── Batch Mode ─────────────────────────────────────────────────────────
     with st.expander("➕ Batch Mode (Multiple Queries)", expanded=False):
         batch_queries_text = st.text_area(
-            "Enter multiple queries (one per line):",
+            "Enter up to 10 queries (one per line):",
             height=150,
+            placeholder="Query 1\nQuery 2\n...\nQuery 10",
             key="batch_queries",
+            help="Batch mode runs each query as a separate session. Use 'Reload between batches' for a fresh browser each time.",
         )
         batch_mode = st.checkbox("Enable Batch Mode", value=False)
+        batch_reload = st.checkbox(
+            "🔄 Reload browser between each batch (recommended)",
+            value=True,
+            key="batch_reload",
+            help="After each query: save, close browser, start fresh — prevents 'trying twice' issues and improves reliability for 3+ queries.",
+        )
+
+    # ── Search Engine (prominent - above Settings) ─────────────────────────
+    st.markdown("**🦆 Search Engine**")
+    eng_col1, eng_col2 = st.columns([1, 3])
+    with eng_col1:
+        search_engine = st.selectbox(
+            "Engine",
+            ["duckduckgo", "google"],
+            format_func=lambda x: "🦆 DuckDuckGo (no CAPTCHA)" if x == "duckduckgo" else "🔍 Google",
+            index=0 if st.session_state.get("search_engine", "duckduckgo") == "duckduckgo" else 1,
+            key="main_search_engine",
+            help="DuckDuckGo avoids CAPTCHA. Use Google only if needed.",
+        )
+        st.session_state.search_engine = search_engine
+    with eng_col2:
+        if search_engine == "google":
+            st.warning("⚠️ Google may show CAPTCHA on repeat runs. Switch to DuckDuckGo to avoid.")
+        else:
+            st.success("✅ DuckDuckGo selected — no CAPTCHA blocks")
+    st.caption("Choose DuckDuckGo to avoid getting blocked by Google's CAPTCHA.")
+    st.divider()
 
     # ── Settings ───────────────────────────────────────────────────────────
     with st.expander("⚙️ Settings", expanded=True):
@@ -446,10 +492,21 @@ def render_extractor_page():
 
         with col2:
             st.markdown("**Server Settings**")
+            st.caption("Search Engine: set in sidebar → ⚙️ Engine")
+            headless_live = st.checkbox(
+                "🖥️ Run headless (no browser window)",
+                value=bool(st.session_state.settings.get("headless", False)),
+                key="live_headless",
+                help="Headless = no visible browser. Activity still shows in logs; PDFs and emails are extracted normally. Use when the automation window doesn't pop up."
+            )
+            st.session_state.settings["headless"] = headless_live
+            if headless_live:
+                st.caption("✅ Headless: logs + extracted leads will update live")
             server_url = st.text_input("Server URL", value=WEBSOCKET_URL, help="WebSocket server URL")
             auto_save = st.checkbox("Auto-Save to Database", value=True)
-            target_leads = st.number_input("Target Lead Count (0 = no limit)", min_value=0, max_value=10000, value=0, step=10, help="Stop automatically when this many leads are extracted")
+            target_leads = st.number_input("Target Lead Count (0 = no limit)", min_value=0, max_value=500000, value=0, step=100, help="0 = run until no more pages. Set a number to stop when that many leads are extracted.")
             st.session_state.target_lead_count = target_leads
+            st.session_state.search_engine = search_engine
 
     # ── Status Bar with Real-time Lead Count ─────────────────────────────
     status_text = "Ready" if not st.session_state.is_running else "🔄 Running..."
@@ -486,6 +543,51 @@ def render_extractor_page():
                 st.progress(progress / 100)
                 st.caption(f"{progress:.1f}% complete")
 
+    # ── Browser visibility tip (platform-specific) ─────────────────────────
+    import platform
+    if platform.system() == "Darwin":
+        st.info(
+            "💡 **Browser not showing?** Enable **🖥️ Run headless** above — you'll still see activity in the logs and get extracted emails. "
+            "Or double-click `START_LEAD_EXTRACTOR.command` for a visible Chrome window."
+        )
+    elif platform.system() == "Windows":
+        st.info(
+            "💡 **Browser not showing?** Enable **🖥️ Run headless** above, or use **🖥️ Launch in CMD** to run from Command Prompt for a visible browser."
+        )
+
+    # ── Launch in Terminal/CMD (for visible browser) ───────────────────────
+    import subprocess
+    from pathlib import Path
+    proj = Path(__file__).resolve().parent.parent
+    if platform.system() == "Darwin":
+        if st.button("🖥️ Launch in Terminal (browser will pop up)", key="launch_terminal", help="Opens macOS Terminal — use if browser window doesn't appear"):
+            try:
+                cmd = f"cd {proj} && python3 launch_app_simple.py"
+                script = f'tell application "Terminal" to do script "{cmd}"'
+                subprocess.run(["osascript", "-e", script], check=False, timeout=5)
+                st.success("Terminal opened. Use the app there — the browser will pop up when you click Start.")
+            except Exception as e:
+                st.error(f"Could not open Terminal: {e}")
+    elif platform.system() == "Windows":
+        if st.button("🖥️ Launch in CMD (browser will pop up)", key="launch_cmd", help="Opens Command Prompt — use if browser window doesn't appear"):
+            try:
+                proj_str = str(proj).replace("'", "''")  # Escape for cmd
+                subprocess.Popen(
+                    ["cmd", "/k", f'cd /d "{proj}" && python launch_app_windows.py'],
+                    cwd=str(proj),
+                    creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
+                )
+                st.success("Command Prompt opened. Use the app there — the browser will pop up when you click Start.")
+            except Exception as e:
+                st.error(f"Could not open Command Prompt: {e}")
+
+    # ── Pre-start engine indicator ───────────────────────────────────────
+    active_engine = st.session_state.get("search_engine", "duckduckgo")
+    if active_engine == "duckduckgo":
+        st.info("🦆 **When you click Start:** Extraction will use **DuckDuckGo** — no CAPTCHA.")
+    else:
+        st.warning("⚠️ **When you click Start:** Extraction will use **Google** — you may see CAPTCHA. Switch to DuckDuckGo above to avoid.")
+
     # ── Controls ──────────────────────────────────────────────────────────
     col1, col2, col3, col4 = st.columns(4)
     with col1:
@@ -515,24 +617,16 @@ def render_extractor_page():
         st.session_state.activity_log = []
         st.session_state.extracted_leads = []
         st.session_state.current_screenshot = None
-        with st.session_state.ws_lock:
-            st.session_state.ws_data["activity_log"] = []
-            st.session_state.ws_data["extracted_leads"] = []
-            st.session_state.ws_data["current_screenshot"] = None
-            st.session_state.ws_data["saved_files"] = []
-            st.session_state.ws_data["current_lead_count"] = 0
         st.rerun()
 
     # ── Stop Button Handler ───────────────────────────────────────────────────
     if stop_btn:
         st.session_state.is_running = False
-        with st.session_state.ws_lock:
-            st.session_state.ws_data["is_running"] = False
-        ws_client = st.session_state.ws_data.get("ws_client")
-        if ws_client:
+        ws = _ws_client_ref[0] if _ws_client_ref else None
+        if ws:
             try:
-                if hasattr(ws_client, 'send'):
-                    ws_client.send(json.dumps({"command": "stop"}))
+                if hasattr(ws, "send"):
+                    ws.send(json.dumps({"command": "stop"}))
                     st.session_state.activity_log.append("🛑 Stop command sent to server...")
                 else:
                     st.session_state.activity_log.append("🛑 Stop requested (connection closing...)")
@@ -566,7 +660,9 @@ def render_extractor_page():
     if start_btn:
         queries = []
         if batch_mode and batch_queries_text:
-            queries = [q.strip() for q in batch_queries_text.split("\n") if q.strip()]
+            queries = [q.strip() for q in batch_queries_text.split("\n") if q.strip()][:10]
+            if len([q for q in batch_queries_text.split("\n") if q.strip()]) > 10:
+                st.warning("Only first 10 queries will run. Rest ignored.")
         elif query_input:
             queries = [query_input.strip()]
 
@@ -578,29 +674,36 @@ def render_extractor_page():
             st.session_state.activity_log = []
             st.session_state.current_screenshot = None
             st.session_state.saved_files = []
-            # Reset shared data
-            with st.session_state.ws_lock:
-                ws = st.session_state.ws_data
-                ws["activity_log"] = []
-                ws["extracted_leads"] = []
-                ws["current_screenshot"] = None
-                ws["saved_files"] = []
-                ws["current_lead_count"] = 0
-                ws["is_running"] = True
-                ws["needs_refresh"] = False
 
+            # Create queue for thread-safe updates (WS thread must NOT touch session_state)
+            msg_queue = Queue()
+            st.session_state.ws_message_queue = msg_queue
             target_leads = st.session_state.get("target_lead_count", 0)
+            search_engine = st.session_state.get("search_engine", "duckduckgo")
+            headless = bool(st.session_state.settings.get("headless", False))
+            batch_reload = bool(batch_mode and st.session_state.get("batch_reload", True))
             thread = threading.Thread(
-                target=websocket_client,
-                args=(queries, max_pages, delay_pages, delay_actions,
-                      st.session_state.ws_data, st.session_state.ws_lock, target_leads),
+                target=run_websocket_client,
+                args=(queries, max_pages, delay_pages, delay_actions, msg_queue, target_leads, search_engine, headless, batch_reload),
                 daemon=True,
             )
             thread.start()
 
-    # ── Auto-refresh when running (smooth, no flicker) ─────────────────────
+    # ── Auto-refresh when running (throttled) ──────────────────────────────
     if st.session_state.is_running:
-        st_autorefresh(interval=2000, limit=None, key="live_autorefresh")
+        # Throttle reruns to max 2 per second
+        current_time = time.time()
+        if not hasattr(st.session_state, 'last_rerun_time'):
+            st.session_state.last_rerun_time = 0
+        
+        if (current_time - st.session_state.last_rerun_time) >= 0.25:  # ~4 reruns/sec for live activity log + screenshot updates
+            placeholder = st.empty()
+            placeholder.markdown("🔄 Live updates...")
+            time.sleep(0.2)  # Small delay for WebSocket updates
+            if st.session_state.needs_refresh:
+                st.session_state.needs_refresh = False
+            st.session_state.last_rerun_time = current_time
+            st.rerun()
 
     # ── Saved Files Display ─────────────────────────────────────────────────
     if st.session_state.saved_files:
@@ -736,18 +839,66 @@ def render_saved_leads_page():
                 lead_copy = dict(lead)
                 lead_copy["_session_id"] = sid
                 all_merged.append(lead_copy)
-        
-        # Dedupe by email (keep first)
-        seen = set()
-        unique = []
-        for l in all_merged:
-            e = (l.get("email") or "").lower().strip()
-            if e and "@" in e and e not in seen:
-                seen.add(e)
-                unique.append(l)
-        
-        st.success(f"✅ {len(unique)} unique leads (from {len(all_merged)} total across {len(st.session_state.saved_leads_selected_ids)} session(s))")
-        
+
+        # Export mode: Full | Unique (dedup only) | Unique valid (dedup + validation)
+        export_mode = st.radio(
+            "Export mode",
+            [
+                "Full (all leads, no dedup)",
+                "Unique (dedup only, any email with @)",
+                "Unique valid (dedup + strict validation)",
+            ],
+            key="saved_export_mode",
+            help="Full = everything. Unique = dedupe by email. Unique valid = dedupe + format validation.",
+        )
+        use_full = "Full" in export_mode
+        use_validation = "valid" in export_mode.lower()
+
+        if use_full:
+            export_leads = all_merged
+            msg = f"📋 {len(export_leads)} leads (full, no dedup)"
+            st.info(msg)
+        else:
+            # Dedupe by email (keep first); optionally validate format
+            seen = set()
+            unique = []
+            no_email_count = 0
+            invalid_count = 0
+            dup_count = 0
+            for l in all_merged:
+                e = (l.get("email") or "").strip()
+                if not e or "@" not in e:
+                    no_email_count += 1
+                    continue
+                norm = e.lower()
+                if use_validation:
+                    try:
+                        validated = validate_email(norm, check_deliverability=False)
+                        norm = validated.email
+                    except EmailNotValidError:
+                        invalid_count += 1
+                        continue
+                if norm not in seen:
+                    seen.add(norm)
+                    l_copy = dict(l)
+                    l_copy["email"] = norm
+                    unique.append(l_copy)
+                else:
+                    dup_count += 1
+            export_leads = unique
+
+            if use_validation:
+                msg = f"✅ {len(export_leads)} unique valid leads (from {len(all_merged)} total)"
+            else:
+                msg = f"✅ {len(export_leads)} unique leads (from {len(all_merged)} total, dedup only)"
+            st.success(msg)
+            with st.expander("📊 Breakdown (why leads were excluded)"):
+                st.markdown(f"- **No email:** {no_email_count} (leads with empty/missing email)")
+                if use_validation:
+                    st.markdown(f"- **Invalid format:** {invalid_count} (failed email validation)")
+                st.markdown(f"- **Duplicate:** {dup_count} (same email already seen)")
+                st.caption("Try **Full** to export everything, or **Unique (dedup only)** if validation drops too many.")
+
         # Column filter
         preset = st.selectbox(
             "Filter columns to show/export",
@@ -755,34 +906,34 @@ def render_saved_leads_page():
             key="saved_preset",
         )
         st.session_state.saved_leads_column_preset = preset
-        cols = [c for c in COLUMN_PRESETS[preset] if c in (unique[0].keys() if unique else [])]
+        cols = [c for c in COLUMN_PRESETS[preset] if c in (export_leads[0].keys() if export_leads else [])]
         if not cols:
             cols = list(COLUMN_PRESETS[preset])
-        
+
         # Preview
-        df_merged = pd.DataFrame(unique)
+        df_merged = pd.DataFrame(export_leads)
         show_cols = [c for c in cols if c in df_merged.columns]
         display_df = df_merged[show_cols] if show_cols else df_merged
         if not display_df.empty:
             st.dataframe(display_df, use_container_width=True, hide_index=True)
-        
+
         # Export merged
         st.markdown("**Download merged (filtered columns):**")
         e1, e2, e3, e4 = st.columns(4)
         with e1:
-            csv_data = leads_to_dataframe(unique, columns=COLUMN_PRESETS[preset]).to_csv(index=False)
+            csv_data = leads_to_dataframe(export_leads, columns=COLUMN_PRESETS[preset]).to_csv(index=False)
             st.download_button("⬇️ CSV", data=csv_data, file_name="merged_leads.csv", mime="text/csv", key="dl_merged_csv")
         with e2:
             if st.button("📄 Save CSV", key="save_merged_csv"):
-                path = export_to_csv(unique, f"merged_{len(unique)}_leads.csv", columns=COLUMN_PRESETS[preset])
+                path = export_to_csv(export_leads, f"merged_{len(export_leads)}_leads.csv", columns=COLUMN_PRESETS[preset])
                 st.success(f"✅ {path}")
         with e3:
             if st.button("📊 Save Excel", key="save_merged_xlsx"):
-                path = export_to_excel(unique, f"merged_{len(unique)}_leads.xlsx", columns=COLUMN_PRESETS[preset])
+                path = export_to_excel(export_leads, f"merged_{len(export_leads)}_leads.xlsx", columns=COLUMN_PRESETS[preset])
                 st.success(f"✅ {path}")
         with e4:
             if st.button("📧 Use for Email Campaign", key="use_merged_email"):
-                st.session_state.merged_leads_for_email = unique
+                st.session_state.merged_leads_for_email = export_leads
                 st.session_state.selected_session_ids = list(st.session_state.saved_leads_selected_ids)
                 st.session_state.current_page = "📧 Email Sender"
                 st.rerun()
@@ -837,8 +988,56 @@ def render_settings_page():
     """Render settings page"""
     st.markdown('<p class="app-title">⚙️ Settings</p>', unsafe_allow_html=True)
     st.markdown('<p class="app-subtitle">Configure application settings</p>', unsafe_allow_html=True)
-    
-    st.info("Settings page coming soon! For now, use the sidebar to check server status and view stats.")
+
+    # ── Search Engine (prominent - most requested) ─────────────────────────
+    st.markdown("### 🦆 Search Engine")
+    search_engine = st.selectbox(
+        "Choose which search engine to use for lead extraction:",
+        ["duckduckgo", "google"],
+        format_func=lambda x: "🦆 DuckDuckGo (recommended – no CAPTCHA)" if x == "duckduckgo" else "🔍 Google (may show CAPTCHA)",
+        index=0 if st.session_state.get("search_engine", "duckduckgo") == "duckduckgo" else 1,
+        key="settings_search_engine",
+        help="DuckDuckGo is recommended to avoid Google CAPTCHA blocks.",
+    )
+    st.session_state.search_engine = search_engine
+    if search_engine == "google":
+        st.warning("⚠️ Google may show CAPTCHA on repeat runs. Switch to DuckDuckGo to avoid.")
+    else:
+        st.success("✅ DuckDuckGo selected — no CAPTCHA blocks")
+
+    st.divider()
+
+    # ── Automation Settings ─────────────────────────────────────────────────
+    st.markdown("### ⚙️ Automation")
+    settings = st.session_state.settings
+    col1, col2 = st.columns(2)
+    with col1:
+        max_pages = st.number_input("Max Pages per Query", min_value=1, max_value=20, value=int(settings.get("max_pages", 10)), step=1, key="set_max_pages")
+        delay_pages = st.number_input("Delay Between Pages (s)", min_value=0.0, max_value=10.0, value=float(settings.get("delay_pages", 2.0)), step=0.5, key="set_delay_pages")
+    with col2:
+        delay_actions = st.number_input("Action Delay (s)", min_value=0.0, max_value=5.0, value=float(settings.get("delay_actions", 1.0)), step=0.1, key="set_delay_actions")
+        headless = st.checkbox(
+            "🖥️ Run headless (no browser window)",
+            value=bool(settings.get("headless", False)),
+            key="set_headless",
+            help="Use when the automation window doesn't pop up. Activity still shows in logs; PDFs and emails are extracted normally."
+        )
+
+    # Save button
+    if st.button("💾 Save Settings", type="primary", key="save_settings_btn"):
+        new_settings = dict(settings)
+        new_settings["search_engine"] = search_engine
+        new_settings["max_pages"] = max_pages
+        new_settings["delay_pages"] = delay_pages
+        new_settings["delay_actions"] = delay_actions
+        new_settings["headless"] = headless
+        save_settings(new_settings)
+        st.session_state.settings = load_settings()
+        st.success("Settings saved successfully.")
+        st.rerun()
+
+    st.divider()
+    st.caption("Server status and stats are available in the sidebar.")
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────

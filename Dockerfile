@@ -1,6 +1,5 @@
 # Lead Extractor Pro - Cloud deployment (Streamlit + FastAPI + Playwright)
-# Pin to Bookworm: Playwright install-deps doesn't support Debian Trixie yet
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim
 
 # Install system deps for Playwright/Chromium
 RUN apt-get update && apt-get install -y \

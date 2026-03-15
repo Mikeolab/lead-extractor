@@ -2,9 +2,6 @@
 # Start FastAPI in background, Streamlit in foreground (for cloud deployment)
 set -e
 
-# So that "from app.xxx" resolves when running from /app
-export PYTHONPATH=/app
-
 echo "Starting automation server on port 8000..."
 uvicorn app.server.automation_server:app --host 0.0.0.0 --port 8000 &
 UVICORN_PID=$!

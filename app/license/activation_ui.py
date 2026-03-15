@@ -7,9 +7,7 @@ from typing import Optional, Dict, Tuple
 import streamlit as st
 from app.license.machine_id import get_machine_id
 from app.license.validator import validate_license, LicenseInfo
-from app.license.session_lock import get_license_session_id, claim_license_session, touch_license_session
 from app.config import LICENSE_SECRET
-from app.database.db import using_postgres
 from app.users.manager import user_manager
 
 # Try to import pyperclip, fallback if not available
@@ -29,47 +27,26 @@ def show_activation_dialog() -> bool:
     """
     st.title("🔐 License Activation Required")
     
-    if st.session_state.get("license_error_message"):
-        st.error(st.session_state.license_error_message)
-        st.session_state.license_error_message = None  # show once
-    
     st.info(
         "This software requires a valid license key to operate. "
         "Please follow the steps below to activate your license."
     )
     
-    # Step 1: Show Hardware ID (desktop only — on web the ID is the server, not the user)
-    if not using_postgres():
-        st.subheader("Step 1: Get Your Hardware ID")
-        st.write("Copy your Hardware ID and send it to the administrator to receive your license key.")
-        
-        machine_id = get_machine_id()
-        formatted_machine_id = f"{machine_id[:4]}-{machine_id[4:8]}-{machine_id[8:12]}-{machine_id[12:16]}"
-        
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            hardware_id_input = st.text_input(
-                "Your Hardware ID:",
-                value=formatted_machine_id,
-                disabled=True,
-                key="hardware_id_display"
-            )
-        with col2:
-            if st.button("📋 Copy", key="copy_hardware_id"):
-                if HAS_PYPERCLIP:
-                    try:
-                        pyperclip.copy(machine_id)
-                        st.success("✅ Hardware ID copied to clipboard!")
-                    except Exception:
-                        st.error("❌ Could not copy to clipboard. Please copy manually.")
-                else:
-                    st.text_area("Copy this:", machine_id, key="hardware_id_copy", height=50)
-                    st.info("Please copy the Hardware ID above manually")
-        
-        st.divider()
+    # Step 1: Show Hardware ID
+    st.subheader("Step 1: Get Your Hardware ID")
+    st.write("Copy your Hardware ID and send it to the administrator to receive your license key.")
     
-    # Enter License Key
-    st.subheader("Enter Your License Key")
+    machine_id = get_machine_id()
+    
+    # Use st.code() - has built-in copy button that works in browsers (pyperclip fails in Streamlit/browser)
+    st.caption("Your Hardware ID (click the copy icon to copy):")
+    st.code(machine_id, language=None)
+    st.caption("Send this ID to the administrator to receive your license key.")
+    
+    st.divider()
+    
+    # Step 2: Enter License Key
+    st.subheader("Step 2: Enter Your License Key")
     st.write("Enter the license key you received via email to activate the software.")
     
     license_key = st.text_input(
@@ -95,27 +72,20 @@ def show_activation_dialog() -> bool:
                 if not license_info.valid:
                     st.error(f"❌ Invalid license key: {license_info.error}")
                 else:
-                    # Check machine ID (skip on web/server — machine_id is the container, not the user)
-                    if not using_postgres():
-                        current_machine_id = get_machine_id()
-                        from app.license.generator import decode_license_key
-                        payload = decode_license_key(clean_license_key)
-                        if payload and payload.get("machine_id"):
-                            if payload["machine_id"] != current_machine_id:
-                                st.error(
-                                    "❌ License not valid for this computer. "
-                                    "This license is bound to a different machine."
-                                )
-                                return False
-                    else:
-                        current_machine_id = "web"
+                    # Check machine ID
+                    current_machine_id = get_machine_id()
+                    # Note: Machine ID check will be added when we update the generator
+                    # For now, we'll check if machine_id is in the payload
+                    from app.license.generator import decode_license_key
+                    payload = decode_license_key(clean_license_key)
                     
-                    # One session per license: claim this license for this device/browser
-                    session_id = get_license_session_id()
-                    ok, err = claim_license_session(clean_license_key, session_id)
-                    if not ok:
-                        st.error(f"❌ {err}")
-                        return False
+                    if payload and payload.get("machine_id"):
+                        if payload["machine_id"] != current_machine_id:
+                            st.error(
+                                "❌ License not valid for this computer. "
+                                "This license is bound to a different machine."
+                            )
+                            return False
                     
                     # Create user from license
                     user = user_manager.create_user_from_license(clean_license_key)
@@ -129,29 +99,20 @@ def show_activation_dialog() -> bool:
                         # Store in database
                         from app.database.db import get_connection
                         conn = get_connection()
-                        if not using_postgres():
-                            conn.execute(
-                                """CREATE TABLE IF NOT EXISTS app_license (
-                                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                                    license_key TEXT UNIQUE,
-                                    machine_id TEXT,
-                                    activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                                    is_active BOOLEAN DEFAULT 1
-                                )"""
-                            )
-                        if using_postgres():
-                            conn.execute(
-                                """INSERT INTO app_license (license_key, machine_id, is_active)
-                                   VALUES (?, ?, TRUE)
-                                   ON CONFLICT (license_key) DO UPDATE SET machine_id = excluded.machine_id, is_active = TRUE""",
-                                (clean_license_key, current_machine_id)
-                            )
-                        else:
-                            conn.execute(
-                                """INSERT OR REPLACE INTO app_license (license_key, machine_id, is_active)
-                                   VALUES (?, ?, 1)""",
-                                (clean_license_key, current_machine_id)
-                            )
+                        conn.execute(
+                            """CREATE TABLE IF NOT EXISTS app_license (
+                                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                license_key TEXT UNIQUE,
+                                machine_id TEXT,
+                                activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                is_active BOOLEAN DEFAULT 1
+                            )"""
+                        )
+                        conn.execute(
+                            """INSERT OR REPLACE INTO app_license (license_key, machine_id, is_active)
+                               VALUES (?, ?, 1)""",
+                            (clean_license_key, current_machine_id)
+                        )
                         conn.commit()
                         conn.close()
                         
@@ -189,78 +150,55 @@ def check_license() -> Tuple[bool, Optional[Dict]]:
         # Quick validation
         license_info = validate_license(license_key, LICENSE_SECRET)
         if license_info.valid:
-            # One session per license: must still hold the claim
-            session_id = get_license_session_id()
-            ok, err = claim_license_session(license_key, session_id)
-            if not ok:
-                st.session_state.license_valid = False
-                st.session_state.license_key = None
-                st.session_state.user = None
-                st.session_state.license_error_message = err  # show in activation dialog
-                return False, None
-            
-            # On web (PostgreSQL), skip machine_id check — it's the server, not the user
-            if using_postgres():
-                touch_license_session(license_key, session_id)
-                return True, st.session_state.get("user")
-            
-            # Desktop: check machine ID
+            # Check machine ID
             current_machine_id = get_machine_id()
             from app.license.generator import decode_license_key
             payload = decode_license_key(license_key)
             
             if payload and payload.get("machine_id"):
                 if payload["machine_id"] == current_machine_id:
-                    touch_license_session(license_key, session_id)
                     return True, st.session_state.get("user")
             
+            # If no machine_id in payload, allow (backward compatibility)
             if not payload or not payload.get("machine_id"):
-                touch_license_session(license_key, session_id)
                 return True, st.session_state.get("user")
     
     # Check database
     from app.database.db import get_connection
     conn = get_connection()
     
-    if not using_postgres():
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS app_license (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                license_key TEXT UNIQUE,
-                machine_id TEXT,
-                activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_active BOOLEAN DEFAULT 1
-            )
-        """)
-        conn.commit()
+    # Ensure table exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_license (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT UNIQUE,
+            machine_id TEXT,
+            activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_active BOOLEAN DEFAULT 1
+        )
+    """)
     
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT license_key FROM app_license WHERE is_active = TRUE ORDER BY activated_at DESC LIMIT 1"
+        "SELECT license_key FROM app_license WHERE is_active = 1 ORDER BY activated_at DESC LIMIT 1"
     )
     row = cursor.fetchone()
     conn.close()
     
     if row:
-        license_key = row[0] if not hasattr(row, "get") else row["license_key"]
+        license_key = row[0]
         
         # Validate
         license_info = validate_license(license_key, LICENSE_SECRET)
         if license_info.valid:
-            # One session per license: claim for this device/browser
-            session_id = get_license_session_id()
-            ok, _ = claim_license_session(license_key, session_id)
-            if not ok:
-                return False, None
+            # Check machine ID
+            current_machine_id = get_machine_id()
+            from app.license.generator import decode_license_key
+            payload = decode_license_key(license_key)
             
-            # On web, skip machine_id check
-            if not using_postgres():
-                current_machine_id = get_machine_id()
-                from app.license.generator import decode_license_key
-                payload = decode_license_key(license_key)
-                if payload and payload.get("machine_id"):
-                    if payload["machine_id"] != current_machine_id:
-                        return False, None
+            if payload and payload.get("machine_id"):
+                if payload["machine_id"] != current_machine_id:
+                    return False, None
             
             # Get or create user
             user = user_manager.get_user_by_license(license_key)
@@ -271,7 +209,6 @@ def check_license() -> Tuple[bool, Optional[Dict]]:
                 st.session_state.license_key = license_key
                 st.session_state.user = user
                 st.session_state.license_valid = True
-                touch_license_session(license_key, session_id)
                 return True, user
     
     return False, None

@@ -47,9 +47,6 @@ class _CursorAdapter:
             self._cur.execute(sql, params)
         else:
             self._cur.execute(sql)
-        # Refresh column order so fetchone/fetchall return correct rows
-        if self._cur.description:
-            self._col_order = [d[0] for d in self._cur.description]
         # Capture last inserted id for INSERT
         if sql.strip().upper().startswith("INSERT") and "RETURNING" not in sql.upper():
             try:
@@ -115,9 +112,6 @@ class _ConnectionAdapter:
 
     def close(self):
         self._conn.close()
-
-
-_tables_initialized = False
 
 
 def _get_raw_conn():
@@ -234,11 +228,6 @@ def _init_tables(conn):
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 expires_at TIMESTAMP
             );
-            CREATE TABLE IF NOT EXISTS license_active_sessions (
-                license_key TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                last_seen_ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
         """)
         # Add user_id to searches/leads if missing (idempotent)
         for tbl, col in [("searches", "user_id"), ("leads", "user_id")]:
@@ -246,34 +235,19 @@ def _init_tables(conn):
                 cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} INTEGER")
             except psycopg2.ProgrammingError:
                 pass  # Column exists
-        # Clear stale session locks on startup so users aren't locked out after redeploys
-        cur.execute("DELETE FROM license_active_sessions")
     conn.commit()
-
-
-def _ensure_tables_once():
-    """Run DDL exactly once per process to avoid deadlocks."""
-    global _tables_initialized
-    if _tables_initialized:
-        return
-    conn = _get_raw_conn()
-    try:
-        _init_tables(conn)
-        _tables_initialized = True
-    finally:
-        conn.close()
 
 
 def get_connection():
     """Get connection - returns adapter for SQLite-compatible API."""
-    _ensure_tables_once()
     conn = _get_raw_conn()
+    _init_tables(conn)
     return _ConnectionAdapter(conn)
 
 
 def save_search(query: str, num_results: int = 0) -> int:
-    _ensure_tables_once()
     conn = _get_conn()
+    _init_tables(conn)
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO searches (query, num_results) VALUES (%s, %s) RETURNING id",
@@ -285,12 +259,14 @@ def save_search(query: str, num_results: int = 0) -> int:
     return search_id
 
 
-def save_leads(search_id: int, leads: list[dict]) -> int:
+def save_leads(search_id: int, leads: list[dict], replace: bool = False) -> int:
     if not leads:
         return 0
     conn = _get_conn()
-    count = 0
     with conn.cursor() as cur:
+        if replace:
+            cur.execute("DELETE FROM leads WHERE search_id = %s", (search_id,))
+        count = 0
         for lead in leads:
             cur.execute(
                 """INSERT INTO leads 

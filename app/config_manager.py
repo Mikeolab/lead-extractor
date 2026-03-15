@@ -16,6 +16,7 @@ SETTINGS_FILE = Path.home() / f".{APP_NAME.lower().replace(' ', '_')}_settings.j
 def load_settings() -> Dict[str, Any]:
     """Load saved settings from file."""
     default = {
+        "search_engine": "duckduckgo",  # DuckDuckGo avoids Google CAPTCHA
         "search_mode": "pdf",
         "max_pages": 10,
         "delay_pages": 2.0,
@@ -27,7 +28,7 @@ def load_settings() -> Dict[str, Any]:
         "auto_save": True,
         "output_format": "PDF",
         "output_file": "results",
-        "headless": False,  # Show browser by default for visual feedback
+        "headless": True,  # Default ON: works everywhere (Cursor, Terminal, CI). Uncheck + run from Terminal for visible browser.
         "show_browser": True,  # Show live browser view in UI
         "delay_actions": 1.0,
         "filter_domains": "",

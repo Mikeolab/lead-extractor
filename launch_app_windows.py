@@ -16,6 +16,20 @@ if getattr(sys, 'frozen', False):
     base_path = Path(sys._MEIPASS)
     app_path = base_path / "app"
     main_script = app_path / "main.py"
+    # Point Playwright to bundled Chromium ONLY if the actual executable exists.
+    # Playwright expects: playwright_browsers/chromium-XXXX/chrome-win/chrome.exe (Windows)
+    # If missing (ENOENT), do NOT set - Playwright will fall back to default cache.
+    _bundled = base_path / "playwright_browsers"
+    _chromium_exe = None
+    if _bundled.exists():
+        for d in _bundled.iterdir():
+            if d.is_dir() and d.name.startswith("chromium-"):
+                _exe = d / "chrome-win" / "chrome.exe" if sys.platform == "win32" else d / "chrome-mac" / "Chromium"
+                if _exe.exists():
+                    _chromium_exe = _exe
+                    break
+    if _chromium_exe is not None:
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(_bundled)
 else:
     # Development mode
     base_path = Path(__file__).parent
@@ -73,6 +87,14 @@ def acquire_lock():
         except:
             pass
         return None
+
+def _pause_on_exit(message="Press Enter to close..."):
+    """Keep console open so user can read errors (Windows)"""
+    try:
+        print(message, flush=True)
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
 
 def release_lock(lock_fd):
     """Release lock file (Windows)"""
@@ -147,95 +169,81 @@ def start_fastapi_server():
         return False  # Fail silently, app can work without FastAPI
 
 def run_streamlit_in_thread(port, browser_opened_flag):
-    """Run Streamlit in a background thread"""
-    import subprocess
+    """Run Streamlit in a background thread.
+    FROZEN: subprocess with STREAMLIT_CHILD=1 so child skips lock and runs in main thread.
+    NOT frozen: subprocess with python -m streamlit.
+    """
     import webbrowser
     import socket
-    
-    error_log_path = None
+    import subprocess
+
+    error_log_path = Path(os.environ.get('APPDATA', Path.home())) / "LeadExtractorPro" / "error.log"
+    error_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    streamlit_args = [
+        "streamlit", "run", str(main_script),
+        f"--server.port={port}",
+        "--server.address=localhost",
+        "--browser.gatherUsageStats=false",
+        "--server.headless=true",
+        "--global.developmentMode=false",
+        "--server.runOnSave=false",
+        "--server.fileWatcherType=none",
+        "--server.enableCORS=false",
+    ]
+
+    if getattr(sys, 'frozen', False):
+        # FROZEN: spawn exe with STREAMLIT_CHILD=1; child skips lock, runs Streamlit in main thread.
+        streamlit_cmd = [sys.executable] + streamlit_args
+    else:
+        # NOT frozen: use python -m streamlit
+        streamlit_cmd = [sys.executable, "-m"] + streamlit_args
+
     try:
-        # Setup error log path (Windows AppData)
-        error_log_path = Path(os.environ.get('APPDATA', Path.home())) / "LeadExtractorPro" / "error.log"
-        error_log_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        streamlit_cmd = [
-            sys.executable, "-m", "streamlit", "run", str(main_script),
-            f"--server.port={port}",
-            "--server.address=localhost",
-            "--browser.gatherUsageStats=false",
-            "--server.headless=true",
-            "--global.developmentMode=false",
-            "--server.runOnSave=false",
-            "--server.fileWatcherType=none",
-            "--server.enableCORS=false",
-            "--server.enableXsrfProtection=false",
-            "--server.headless=true",
-            "--browser.serverAddress=localhost",
-            f"--browser.serverPort={port}",
-        ]
-        
-        # Disable Streamlit's auto-browser opening via environment variable
         env = os.environ.copy()
-        env["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
-        env["STREAMLIT_SERVER_HEADLESS"] = "true"
-        # CRITICAL: When frozen, main.py needs base_path in PYTHONPATH for "from app.xxx" imports
         env["PYTHONPATH"] = str(base_path)
-        
-        # Run Streamlit - redirect stderr to log file for debugging
+        if getattr(sys, 'frozen', False):
+            env["STREAMLIT_CHILD"] = "1"
         stderr_file = None
         try:
             stderr_file = open(error_log_path.parent / "streamlit_stderr.log", "a")
-        except:
+        except Exception:
             pass
-        
         process = subprocess.Popen(
             streamlit_cmd,
             stdout=subprocess.PIPE,
-            stderr=stderr_file if stderr_file else subprocess.PIPE,
+            stderr=stderr_file or subprocess.PIPE,
             cwd=str(base_path),
             env=env,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0,
         )
-        
-        # Wait for server to be ready (check if port is listening)
-        max_wait = 30  # 30 seconds max
-        waited = 0
-        server_ready = False
-        
-        while waited < max_wait and not server_ready:
+        for _ in range(30):
             time.sleep(1)
-            waited += 1
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(1)
-                result = sock.connect_ex(('127.0.0.1', port))
-                sock.close()
-                if result == 0:
-                    server_ready = True
+                if sock.connect_ex(('127.0.0.1', port)) == 0:
+                    sock.close()
+                    if not browser_opened_flag[0]:
+                        browser_opened_flag[0] = True
+                        try:
+                            webbrowser.open(f"http://localhost:{port}")
+                        except Exception:
+                            pass
                     break
-            except:
+            except Exception:
                 pass
-        
-        # Only open browser once if server is ready and we haven't opened it yet
-        if server_ready and not browser_opened_flag[0]:
-            browser_opened_flag[0] = True
             try:
-                webbrowser.open(f"http://localhost:{port}")
-            except Exception as e:
-                with open(error_log_path, "a") as f:
-                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Browser open error: {e}\n")
-        
-        # Wait for process
+                sock.close()
+            except Exception:
+                pass
         process.wait()
     except Exception as e:
-        # Log error to file for debugging
         try:
-            if error_log_path:
-                with open(error_log_path, "a") as f:
-                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Streamlit thread error: {e}\n")
-                    import traceback
-                    f.write(traceback.format_exc())
-        except:
+            with open(error_log_path, "a") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Streamlit thread error: {e}\n")
+                import traceback
+                f.write(traceback.format_exc())
+        except Exception:
             pass
 
 def kill_existing_instances():
@@ -254,15 +262,18 @@ def kill_existing_instances():
 
 def main():
     """Main launcher - keeps main thread alive for GUI app"""
-    # Kill any existing instances first (bundled exe only)
-    if getattr(sys, 'frozen', False):
-        kill_existing_instances()
-    
+    # NOTE: Do NOT call kill_existing_instances() at startup - it kills ALL
+    # LeadExtractorPro.exe processes including ourselves, causing instant exit.
+    # The lock file handles multiple-instance prevention.
+
     # Acquire lock only for bundled exe (skip in dev so we see errors)
     lock_fd = None
     if getattr(sys, 'frozen', False):
         lock_fd = acquire_lock()
         if lock_fd is None:
+            print("Another instance of Lead Extractor Pro is already running.", file=sys.stderr, flush=True)
+            print("Close it first, or delete: %APPDATA%\\LeadExtractorPro\\.app_lock", file=sys.stderr, flush=True)
+            _pause_on_exit("Press Enter to close...")
             sys.exit(0)
     else:
         # Dev mode: remove any stale lock so it doesn't block next run
@@ -284,7 +295,7 @@ def main():
             from streamlit.web import cli as stcli
         except ImportError as e:
             err_msg = f"Import error: {e}"
-            print(err_msg, file=sys.stderr)
+            print(err_msg, file=sys.stderr, flush=True)
             try:
                 with open(error_log_path, "a") as f:
                     f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {err_msg}\n")
@@ -293,6 +304,27 @@ def main():
             except Exception:
                 pass
             release_lock(lock_fd)
+            _pause_on_exit("Press Enter to close...")
+            sys.exit(1)
+
+        # Pre-flight: test app imports (catches errors before Streamlit starts)
+        os.environ["PYTHONPATH"] = str(base_path)  # Ensure subprocesses find app
+        try:
+            import app.config
+            import app.database.db
+        except Exception as e:
+            err_msg = f"App import error: {e}"
+            print(err_msg, file=sys.stderr, flush=True)
+            import traceback
+            traceback.print_exc()
+            try:
+                with open(error_log_path, "a") as f:
+                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - {err_msg}\n")
+                    f.write(traceback.format_exc())
+            except Exception:
+                pass
+            release_lock(lock_fd)
+            _pause_on_exit("Press Enter to close...")
             sys.exit(1)
         
         # Start FastAPI server first (non-blocking)
@@ -346,23 +378,45 @@ def main():
             # Keep alive loop - check thread status
             try:
                 while streamlit_thread.is_alive():
-                    time.sleep(0.5)  # More responsive
-                    # Check if thread is still running
-                    if not streamlit_thread.is_alive():
-                        break
+                    time.sleep(0.5)
             except KeyboardInterrupt:
                 release_lock(lock_fd)
                 sys.exit(0)
             except Exception as e:
-                # Log any errors in the keep-alive loop
                 try:
                     with open(error_log_path, "a") as f:
                         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Keep-alive error: {e}\n")
                 except:
                     pass
+            # Streamlit thread died - show error so user knows why
+            print("\nStreamlit stopped unexpectedly.", file=sys.stderr, flush=True)
+            log_dir = Path(os.environ.get('APPDATA', Path.home())) / "LeadExtractorPro"
+            print(f"Check logs: {log_dir}\\error.log  {log_dir}\\crash.log", file=sys.stderr, flush=True)
+            _pause_on_exit("Press Enter to close...")
         else:
             # Development mode - run directly
-            print(f"Starting Lead Extractor Pro on http://localhost:{streamlit_port} ...")
+            # Ensure PYTHONPATH for any subprocess Streamlit spawns (Windows often loses this)
+            os.environ["PYTHONPATH"] = str(base_path)
+            os.chdir(str(base_path))
+            print(f"Starting Lead Extractor Pro on http://localhost:{streamlit_port} ...", flush=True)
+            # Pre-flight: test app imports so we see errors before Streamlit starts
+            try:
+                import app.config
+                import app.database.db
+            except Exception as e:
+                print(f"\n*** Import error (fix this before app will run): {e}", file=sys.stderr, flush=True)
+                import traceback
+                traceback.print_exc()
+                if error_log_path:
+                    try:
+                        with open(error_log_path, "a") as f:
+                            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} - Pre-flight import error: {e}\n")
+                            f.write(traceback.format_exc())
+                    except Exception:
+                        pass
+                release_lock(lock_fd)
+                input("\nPress Enter to close...")
+                sys.exit(1)
             sys.argv = [
                 "streamlit", "run", str(main_script),
                 f"--server.port={streamlit_port}",
@@ -376,6 +430,14 @@ def main():
                 "--server.enableXsrfProtection=false",
             ]
             stcli.main()
+            # Streamlit exited - keep console open so user can read any errors
+            log_dir = Path(os.environ.get('APPDATA', Path.home())) / "LeadExtractorPro"
+            print("\n*** Streamlit stopped. Check errors above.", flush=True)
+            print(f"    Logs (if any): {log_dir}\\error.log  {log_dir}\\crash.log", flush=True)
+            try:
+                input("Press Enter to close...")
+            except (EOFError, KeyboardInterrupt):
+                pass
         
     except KeyboardInterrupt:
         release_lock(lock_fd)
@@ -397,6 +459,16 @@ def main():
         release_lock(lock_fd)
 
 if __name__ == "__main__":
+    # When frozen: subprocess spawns exe with STREAMLIT_CHILD=1 so child skips lock
+    # and runs Streamlit in its main thread (signal handlers require main thread).
+    if getattr(sys, 'frozen', False) and os.environ.get("STREAMLIT_CHILD") == "1":
+        os.chdir(str(base_path))
+        os.environ["PYTHONPATH"] = str(base_path)
+        sys.argv = sys.argv[1:] if len(sys.argv) > 1 else ["streamlit", "run", str(main_script)]
+        from streamlit.web import cli as stcli
+        stcli.main()
+        sys.exit(0)
+
     try:
         main()
     except Exception as e:
