@@ -449,9 +449,10 @@ def render_extractor_page():
             height=150,
             placeholder="Query 1\nQuery 2\n...\nQuery 10",
             key="batch_queries",
-            help="Batch mode runs each query as a separate session. Use 'Reload between batches' for a fresh browser each time.",
+            help="Batch mode runs each query as a separate session. Use Reload between batches for a fresh browser each time.",
         )
-        batch_mode = st.checkbox("Enable Batch Mode", value=False)
+        # Batch mode is implicit: if there are one or more batch queries, they will be used.
+        batch_mode = bool(batch_queries_text and any(q.strip() for q in batch_queries_text.split("\n")))
         batch_reload = st.checkbox(
             "🔄 Reload browser between each batch (recommended)",
             value=True,
