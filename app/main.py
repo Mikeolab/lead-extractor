@@ -87,6 +87,41 @@ st.markdown("""
         background: #000;
         padding: 8px;
     }
+
+    .top-nav {
+        position: sticky;
+        top: 0;
+        z-index: 999;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px;
+        border-radius: 10px;
+        background: linear-gradient(90deg, #f3f7ff, #e8efff);
+        border: 1px solid #d1ddff;
+        margin-bottom: 10px;
+    }
+
+    .top-nav button {
+        background: #ffffff;
+        border: 1px solid #b4c6eb;
+        border-radius: 6px;
+        color: #2f4f84;
+        font-weight: 600;
+        padding: 8px 12px;
+        min-width: 80px;
+    }
+
+    .top-nav button:focus, .top-nav button:hover {
+        background: #e4eafc;
+        border-color: #7490d7;
+    }
+
+    .top-nav button.active {
+        background: #2f65d4;
+        border-color: #1f3f96;
+        color: white;
+    }
     
     .bottom-nav {
         position: fixed;
@@ -386,40 +421,22 @@ def render_sidebar():
 
 # ─── Bottom Navigation ────────────────────────────────────────────────────────
 def render_bottom_navigation():
-    """Render bottom navigation tabs"""
-    st.markdown("---")
-    st.markdown("### 📑 Navigation")
-    
-    # Create navigation buttons
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        if st.button("🔍 Live", use_container_width=True, 
-                    type="primary" if st.session_state.current_page == "🔍 Live Extractor" else "secondary",
-                    key="nav_live"):
-            st.session_state.current_page = "🔍 Live Extractor"
-            st.rerun()
-    
-    with col2:
-        if st.button("📋 Saved", use_container_width=True,
-                    type="primary" if st.session_state.current_page == "📋 Saved Leads" else "secondary",
-                    key="nav_saved"):
-            st.session_state.current_page = "📋 Saved Leads"
-            st.rerun()
-    
-    with col3:
-        if st.button("📧 Sender", use_container_width=True,
-                    type="primary" if st.session_state.current_page == "📧 Email Sender" else "secondary",
-                    key="nav_sender"):
-            st.session_state.current_page = "📧 Email Sender"
-            st.rerun()
-    
-    with col4:
-        if st.button("⚙️ Settings", use_container_width=True,
-                    type="primary" if st.session_state.current_page == "⚙️ Settings" else "secondary",
-                    key="nav_settings"):
-            st.session_state.current_page = "⚙️ Settings"
-            st.rerun()
+    """Render top navigation tabs"""
+    # Keep the navigation at top for ease-of-use.
+    st.markdown('<div class="top-nav"></div>', unsafe_allow_html=True)
+
+    nav_value = st.radio(
+        label="",
+        options=["🔍 Live Extractor", "📋 Saved Leads", "📧 Email Sender", "⚙️ Settings"],
+        index={"🔍 Live Extractor": 0, "📋 Saved Leads": 1, "📧 Email Sender": 2, "⚙️ Settings": 3}.get(st.session_state.current_page, 0),
+        format_func=lambda label: label,
+        horizontal=True,
+        key="top_nav_radio"
+    )
+
+    if nav_value != st.session_state.current_page:
+        st.session_state.current_page = nav_value
+        st.experimental_rerun()
 
 
 # ─── Main Extractor Page ─────────────────────────────────────────────────────
@@ -428,6 +445,7 @@ def render_extractor_page():
     q = st.session_state.get("ws_message_queue")
     if drain_ws_queue(q):
         st.rerun()
+
     st.markdown('<p class="app-title">🎯 Live Browser Automation</p>', unsafe_allow_html=True)
     engine = st.session_state.get("search_engine", "duckduckgo")
     subtitle = "Watch the browser automate DuckDuckGo searches in real-time (no CAPTCHA)" if engine == "duckduckgo" else "Watch the browser automate Google searches (may show CAPTCHA)"
@@ -436,7 +454,7 @@ def render_extractor_page():
     # ── Query Input ─────────────────────────────────────────────────────────
     st.markdown("### 🔍 Search Queries")
     query_input = st.text_area(
-        "Enter search query:",
+        "Enter search query (single query). For multiple, use batch mode below:",
         height=70,
         placeholder="Example: 'digital twin engineers' 'service' filetype:pdf intext:@ intext:Livermore, California",
         key="query_input",
@@ -1061,10 +1079,14 @@ def main():
     
     # Render sidebar (always visible)
     render_sidebar()
-    
+
+    # Render navigation bar at page top
+    render_bottom_navigation()
+    st.markdown("---")
+
     # Render current page based on navigation
     current_page = st.session_state.current_page
-    
+
     if current_page == "🔍 Live Extractor":
         render_extractor_page()
     elif current_page == "📋 Saved Leads":
@@ -1073,9 +1095,6 @@ def main():
         render_email_sender_page()
     elif current_page == "⚙️ Settings":
         render_settings_page()
-    
-    # Render bottom navigation at the bottom
-    render_bottom_navigation()
 
 
 if __name__ == "__main__":
