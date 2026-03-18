@@ -26,13 +26,14 @@ def get_connection():
     # Ensure directory exists
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(str(DATABASE_PATH))
+    conn = sqlite3.connect(str(DATABASE_PATH), timeout=60)
     conn.row_factory = sqlite3.Row
+    # allow longer write-lock wait to avoid locked errors when concurrent threads hit DB
+    conn.execute("PRAGMA busy_timeout = 60000")
     conn.execute("PRAGMA journal_mode=WAL")
 
     # Create tables
-    conn.executescript("""
-        CREATE TABLE IF NOT EXISTS searches (
+    conn.executescript("""        CREATE TABLE IF NOT EXISTS searches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             query TEXT NOT NULL,
             num_results INTEGER DEFAULT 0,

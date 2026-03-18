@@ -15,6 +15,83 @@ from app.email.smtp_pool import SMTPConnectionPool
 from app.database.db import get_all_leads, get_connection, get_recent_searches, get_leads_by_search
 
 
+def process_pending_email_queue(batch_size: int = 25):
+    """Process pending emails from the queue and attempt delivery."""
+    pool = MailboxPool()
+    limiter = RateLimiter()
+    smtp_pool = SMTPConnectionPool(max_connections_per_mailbox=5)
+
+    conn = get_connection()
+    conn.execute("PRAGMA busy_timeout = 60000")
+
+    pending_emails = conn.execute(
+        """SELECT q.id, q.campaign_id, q.mailbox_id, q.recipient_email, q.recipient_name, q.subject, q.body
+           FROM email_queue q
+           JOIN mailboxes m ON q.mailbox_id = m.id
+           WHERE q.status = 'pending' AND m.is_active = 1
+           ORDER BY q.priority DESC, q.scheduled_at ASC
+           LIMIT ?""",
+        (batch_size,)
+    ).fetchall()
+
+    if not pending_emails:
+        conn.close()
+        return 0
+
+    processed = 0
+    for item in pending_emails:
+        try:
+            mailbox = pool._get_mailbox_by_id(item['mailbox_id'])
+            if not mailbox:
+                raise RuntimeError('Mailbox no longer exists')
+
+            # send SMTP email
+            smtp_conn = smtp_pool.get_connection(mailbox)
+            if not smtp_conn:
+                raise RuntimeError('No SMTP connection available')
+
+            smtp_pool.send_email(
+                conn=smtp_conn,
+                from_email=mailbox['email'],
+                to_email=item['recipient_email'],
+                subject=item['subject'],
+                body=item['body'],
+                is_html=True,
+            )
+
+            pool.mark_sent(mailbox['id'], conn=conn)
+            limiter.record_sent(mailbox['id'])
+
+            conn.execute(
+                """UPDATE email_queue SET status='sent', attempts=1, sent_at=CURRENT_TIMESTAMP, processed_at=CURRENT_TIMESTAMP, error_message=NULL
+                   WHERE id = ?""",
+                (item['id'],)
+            )
+            processed += 1
+
+        except Exception as err:
+            err_msg = str(err)[:500]
+            if mailbox := pool._get_mailbox_by_id(item['mailbox_id']):
+                pool.mark_error(mailbox['id'], err_msg, conn=conn)
+
+            conn.execute(
+                """UPDATE email_queue SET status='failed', attempts=attempts+1, processed_at=CURRENT_TIMESTAMP, error_message=?
+                   WHERE id = ?""",
+                (err_msg, item['id'])
+            )
+
+        finally:
+            if 'smtp_conn' in locals() and smtp_conn is not None:
+                try:
+                    smtp_pool.return_connection(mailbox['id'], smtp_conn)
+                except Exception:
+                    pass
+
+    conn.commit()
+    conn.close()
+    return processed
+
+
 def render_email_sender_page():
     """Render the Email Campaigns/Sender page"""
     st.markdown('<p class="app-title">📧 Email Campaigns</p>', unsafe_allow_html=True)
@@ -223,13 +300,11 @@ def render_email_sender_page():
             with col1:
                 test_mb_id = st.number_input("Test Mailbox ID", min_value=1, value=1, key="test_mb_id")
                 if st.button("🔍 Test Connection", use_container_width=True):
-                    try:
-                        if pool.test_connection(int(test_mb_id)):
-                            st.success(f"✅ Mailbox #{test_mb_id} connection OK!")
-                        else:
-                            st.error(f"❌ Mailbox #{test_mb_id} connection failed")
-                    except Exception as e:
-                        st.error(f"❌ Error: {str(e)}")
+                    success, message = pool.test_connection(int(test_mb_id))
+                    if success:
+                        st.success(f"✅ Mailbox #{test_mb_id} connection OK! {message}")
+                    else:
+                        st.error(f"❌ Mailbox #{test_mb_id} connection failed: {message}")
             
             with col2:
                 deactivate_mb_id = st.number_input("Deactivate Mailbox ID", min_value=1, value=1, key="deactivate_mb_id")
@@ -550,8 +625,7 @@ def render_email_sender_page():
                     # Create campaign in database
                     conn = get_connection()
                     
-                    # Store session info in campaign name or notes (we'll add notes field later if needed)
-                    # For now, include session IDs in campaign name if from sessions
+                    # Store session info in campaign name or notes
                     final_campaign_name = campaign_name
                     if leads_source == "From Sessions (Extractor)" and st.session_state.selected_session_ids:
                         session_ids_str = ','.join(map(str, st.session_state.selected_session_ids))
@@ -559,49 +633,107 @@ def render_email_sender_page():
                     
                     cursor = conn.execute(
                         """INSERT INTO email_campaigns 
-                           (name, subject_template, body_template, status, total_recipients)
-                           VALUES (?, ?, ?, 'draft', ?)""",
+                           (name, subject_template, body_template, status, total_recipients, started_at)
+                           VALUES (?, ?, ?, 'running', ?, CURRENT_TIMESTAMP)""",
                         (final_campaign_name, subject_template, body_template, len(selected_leads))
                     )
                     campaign_id = cursor.lastrowid
+                    conn.commit()
                     
-                    # Add emails to queue
+                    # Queue emails and send immediately
+                    queued_count = 0
+                    sent_count = 0
+                    failed_count = 0
+                    queue_conn = get_connection()
                     limiter = RateLimiter()
                     smtp_pool = SMTPConnectionPool(max_connections_per_mailbox=5)
-                    
-                    queued_count = 0
+
                     for lead in selected_leads:
-                        # Personalize subject and body
                         subject = subject_template.replace("{{name}}", lead.get('contact_name', '')).replace("{{email}}", lead.get('email', ''))
                         body = body_template.replace("{{name}}", lead.get('contact_name', '')).replace("{{email}}", lead.get('email', '')).replace("{{phone}}", lead.get('phone', ''))
-                        
-                        # Get available mailbox
+
                         if selected_mailbox_id:
                             mailbox = pool._get_mailbox_by_id(selected_mailbox_id)
                         else:
                             mailbox = pool.get_available_mailbox()
-                        
+
                         if not mailbox:
-                            st.warning(f"⚠️ No available mailboxes for lead {lead.get('email')}. Skipping...")
+                            st.warning(f"⚠️ No available mailbox for lead {lead.get('email')}. Skipping this lead.")
                             continue
-                        
-                        # Add to queue
-                        conn.execute(
+
+                        # Add to queue as pending
+                        queue_conn.execute(
                             """INSERT INTO email_queue 
                                (campaign_id, mailbox_id, recipient_email, recipient_name, subject, body, status)
                                VALUES (?, ?, ?, ?, ?, ?, 'pending')""",
                             (campaign_id, mailbox['id'], lead.get('email'), lead.get('contact_name', ''), subject, body)
                         )
                         queued_count += 1
-                    
-                    conn.commit()
-                    conn.close()
-                    
-                    st.success(f"✅ Campaign '{campaign_name}' created! {queued_count} emails queued.")
-                    st.info("💡 Note: Email sending will be implemented in Phase 2 (background workers). For now, emails are queued in the database.")
+
+                        # Attempt send immediately (Phase 2 behavior)
+                        try:
+                            conn_smtp = smtp_pool.get_connection(mailbox)
+                            if not conn_smtp:
+                                raise RuntimeError("No SMTP connection available")
+
+                            smtp_pool.send_email(
+                                conn=conn_smtp,
+                                from_email=mailbox['email'],
+                                to_email=lead.get('email'),
+                                subject=subject,
+                                body=body,
+                                is_html=use_html,
+                            )
+
+                            pool.mark_sent(mailbox['id'], conn=queue_conn)
+                            limiter.record_sent(mailbox['id'])
+                            sent_count += 1
+
+                            queue_conn.execute(
+                                """UPDATE email_queue SET status='sent', attempts=1, sent_at=CURRENT_TIMESTAMP, processed_at=CURRENT_TIMESTAMP, error_message=NULL
+                                   WHERE campaign_id = ? AND recipient_email = ?""",
+                                (campaign_id, lead.get('email'))
+                            )
+
+                        except Exception as send_err:
+                            pool.mark_error(mailbox['id'], str(send_err)[:500], conn=queue_conn)
+                            failed_count += 1
+                            queue_conn.execute(
+                                """UPDATE email_queue SET status='failed', attempts=attempts+1, processed_at=CURRENT_TIMESTAMP, error_message=?
+                                   WHERE campaign_id = ? AND recipient_email = ?""",
+                                (str(send_err)[:500], campaign_id, lead.get('email'))
+                            )
+
+                        finally:
+                            if 'conn_smtp' in locals() and conn_smtp is not None:
+                                try:
+                                    smtp_pool.return_connection(mailbox['id'], conn_smtp)
+                                except Exception:
+                                    pass
+
+                    queue_conn.commit()
+                    queue_conn.close()
+
+                    # After queueing, run a worker pass to process pending emails immediately
+                    processed = process_pending_email_queue(batch_size=50)
+
+                    final_status = 'completed' if failed_count == 0 else 'completed_with_errors'
+                    conn2 = get_connection()
+                    conn2.execute(
+                        """UPDATE email_campaigns
+                           SET status = ?, sent_count = ?, failed_count = ?, completed_at = CURRENT_TIMESTAMP
+                           WHERE id = ?""",
+                        (final_status, sent_count, failed_count, campaign_id)
+                    )
+                    conn2.commit()
+                    conn2.close()
+
+                    st.success(
+                        f"✅ Campaign '{campaign_name}' queued: {queued_count}, sent now: {sent_count}, failed now: {failed_count}, processed from queue: {processed}"
+                    )
                     if "merged_leads_for_email" in st.session_state:
                         del st.session_state.merged_leads_for_email
-                    st.rerun()
+
     
     # ── TAB 3: Campaign Queue ────────────────────────────────────────────────
     with tab3:
@@ -655,7 +787,8 @@ def render_email_sender_page():
                            FROM email_queue
                            WHERE campaign_id = ?
                            ORDER BY id DESC
-                           LIMIT 10"""
+                           LIMIT 10""",
+                        (campaign_id,)
                     ).fetchall()
                     conn.close()
                     

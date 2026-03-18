@@ -118,11 +118,14 @@ class MailboxPool:
         conn.close()
         return mailbox
     
-    def mark_sent(self, mailbox_id: int):
+    def mark_sent(self, mailbox_id: int, conn=None):
         """Mark that an email was sent from this mailbox"""
-        conn = get_connection()
+        own_conn = False
+        if conn is None:
+            conn = get_connection()
+            own_conn = True
+
         now = datetime.now().isoformat()
-        
         conn.execute(
             """UPDATE mailboxes 
                SET sent_today = sent_today + 1,
@@ -131,13 +134,18 @@ class MailboxPool:
                WHERE id = ?""",
             (now, mailbox_id)
         )
-        conn.commit()
-        conn.close()
-    
-    def mark_error(self, mailbox_id: int, error_message: str):
+
+        if own_conn:
+            conn.commit()
+            conn.close()
+
+    def mark_error(self, mailbox_id: int, error_message: str, conn=None):
         """Record an error for this mailbox"""
-        conn = get_connection()
-        
+        own_conn = False
+        if conn is None:
+            conn = get_connection()
+            own_conn = True
+
         conn.execute(
             """UPDATE mailboxes 
                SET error_count = error_count + 1,
@@ -145,8 +153,10 @@ class MailboxPool:
                WHERE id = ?""",
             (error_message[:500], mailbox_id)  # Limit error message length
         )
-        conn.commit()
-        conn.close()
+
+        if own_conn:
+            conn.commit()
+            conn.close()
     
     def deactivate_mailbox(self, mailbox_id: int):
         """Deactivate a mailbox (e.g., if blocked)"""
@@ -170,21 +180,56 @@ class MailboxPool:
         conn.close()
         return [dict(row) for row in rows]
     
-    def test_connection(self, mailbox_id: int) -> bool:
+    def test_connection(self, mailbox_id: int) -> tuple[bool, str]:
         """Test SMTP connection for a mailbox"""
         mailbox = self._get_mailbox_by_id(mailbox_id)
         if not mailbox:
-            return False
-        
-        try:
-            import smtplib
-            conn = smtplib.SMTP(mailbox['smtp_host'], mailbox['smtp_port'])
-            conn.starttls()
-            conn.login(mailbox['smtp_username'], mailbox['smtp_password'])
-            conn.quit()
-            return True
-        except Exception:
-            return False
+            return False, "Mailbox not found"
+
+        import smtplib
+
+        provider = str(mailbox.get('provider', '')).lower()
+        host = mailbox.get('smtp_host')
+        port = mailbox.get('smtp_port') or 587
+        username = mailbox.get('smtp_username')
+        password = mailbox.get('smtp_password')
+
+        if not host or not username or not password:
+            return False, "Missing SMTP host/username/password"
+
+        error_messages = []
+
+        # Bounce through common SMTP connection options
+        attempts = []
+
+        # Try SMTPS on SSL port (465) if applicable
+        attempts.append(('ssl', host, 465))
+        # Try starttls on provided port first (587 default)
+        attempts.append(('starttls', host, port))
+
+        # as fallback try 587 starttls and 465 ssl in case custom port was wrong
+        if port != 587:
+            attempts.append(('starttls', host, 587))
+        if port != 465:
+            attempts.append(('ssl', host, 465))
+
+        for mode, attempt_host, attempt_port in attempts:
+            try:
+                if mode == 'ssl':
+                    smtp = smtplib.SMTP_SSL(attempt_host, attempt_port, timeout=20)
+                else:
+                    smtp = smtplib.SMTP(attempt_host, attempt_port, timeout=20)
+                    smtp.ehlo()
+                    smtp.starttls()
+
+                smtp.login(username, password)
+                smtp.quit()
+                return True, f"Connection successful via {mode.upper()}:{attempt_host}:{attempt_port}"
+            except Exception as e:
+                error_messages.append(f"{mode.upper()} {attempt_host}:{attempt_port} -> {e}")
+                continue
+
+        return False, "; ".join(error_messages)
     
     def _get_mailbox_by_id(self, mailbox_id: int) -> Optional[Dict]:
         """Get mailbox by ID with decrypted password"""
