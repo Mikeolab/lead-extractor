@@ -70,6 +70,7 @@ def add_mailbox(args: argparse.Namespace) -> int:
         smtp_username=args.smtp_username or args.email,
         smtp_password=smtp_password,
         daily_limit=args.daily_limit,
+        smtp_encryption=args.smtp_encryption,
     )
 
     print(
@@ -83,10 +84,12 @@ def add_mailbox(args: argparse.Namespace) -> int:
 
 def test_connection(args: argparse.Namespace) -> None:
     pool = MailboxPool()
-    ok = pool.test_connection(args.mailbox_id)
+    ok, msg = pool.test_connection(args.mailbox_id)
     if ok:
         print(f"✅ SMTP login OK for mailbox id={args.mailbox_id}")
+        print(msg)
         return
+    print(msg)
     raise SystemExit(f"❌ SMTP login FAILED for mailbox id={args.mailbox_id}")
 
 
@@ -162,6 +165,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub_add.add_argument("--smtp-username", default=None)
     sub_add.add_argument("--smtp-password", default=None, help="Prefer SMTP_PASSWORD env var instead")
     sub_add.add_argument("--daily-limit", type=int, default=500)
+    sub_add.add_argument(
+        "--smtp-encryption",
+        default="auto",
+        choices=["auto", "starttls", "ssl"],
+        help="TLS mode: auto (465=SSL, else STARTTLS), starttls, or ssl (implicit TLS)",
+    )
     sub_add.set_defaults(func=add_mailbox)
 
     sub_test = sub.add_parser("test-connection", help="Test SMTP login for a mailbox id")

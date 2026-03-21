@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 
 from app.email.mailbox_pool import MailboxPool
+from app.email.mailbox_validation import validate_aws_ses_mailbox, validate_smtp_mailbox
 from app.email.rate_limiter import RateLimiter
 from app.email.smtp_pool import SMTPConnectionPool
 from app.database.db import get_all_leads, get_connection, get_recent_searches, get_leads_by_search
@@ -168,14 +169,38 @@ def render_email_sender_page():
                 
                 # SMTP providers (Gmail, Outlook, Custom)
                 else:
+                    smtp_encryption = "auto"
                     if provider == "custom":
-                        smtp_host = st.text_input("SMTP Host", value="smtp.example.com", key="add_host")
+                        smtp_host = st.text_input(
+                            "SMTP Host",
+                            placeholder="e.g. mail.yourdomain.com",
+                            key="add_host",
+                            help="Hostname only — no https://. Your host is often mail.* or smtp.* on your domain.",
+                        )
                         smtp_port = st.number_input(
                             "SMTP Port",
                             value=587,
                             min_value=1,
                             max_value=65535,
                             key="add_port",
+                            help="587 = STARTTLS (typical). 465 = SSL/TLS. 25 is often blocked by ISPs.",
+                        )
+                        _enc_labels = {
+                            "Auto — 465 uses SSL, other ports use STARTTLS": "auto",
+                            "STARTTLS — plain connect then TLS (typical for port 587)": "starttls",
+                            "SSL / TLS — implicit encryption (typical for port 465)": "ssl",
+                        }
+                        _picked = st.selectbox(
+                            "SMTP encryption",
+                            list(_enc_labels.keys()),
+                            index=0,
+                            key="add_smtp_encryption",
+                            help="Must match your provider’s docs. Wrong mode usually causes immediate connection errors, not 535.",
+                        )
+                        smtp_encryption = _enc_labels[_picked]
+                        st.caption(
+                            "**587** → usually **STARTTLS**. **465** → usually **SSL (implicit)**. "
+                            "Use **Auto** unless your host says otherwise."
                         )
                     elif provider == "gmail":
                         smtp_host = st.text_input(
@@ -216,55 +241,80 @@ def render_email_sender_page():
                         "Daily Limit",
                         value=500 if provider == "gmail" else 300,
                         min_value=1,
-                        max_value=10_000,
+                        max_value=1_000_000,
                         key="add_limit",
-                        help="Gmail: ~500/day, Outlook: ~300/day (you can lower this to stay safe).",
+                        help="Gmail: ~500/day, Outlook: ~300/day (custom: follow your host’s policy).",
                     )
             
             if st.button("➕ Add Mailbox", type="primary", use_container_width=True):
                 # Validate based on provider type
                 if provider == "aws_ses":
-                    if not name or not email or not aws_access_key or not aws_secret_key:
-                        st.error("Please fill in all AWS SES fields")
+                    api_key_value = f"{aws_access_key}:{aws_secret_key}:{aws_region}"
+                    ok, val_errors, _norm = validate_aws_ses_mailbox(
+                        name=name,
+                        email=email,
+                        aws_access_key=aws_access_key,
+                        aws_secret_key=aws_secret_key,
+                        aws_region=aws_region,
+                        daily_limit=daily_limit,
+                    )
+                    if not ok:
+                        st.error("Please fix the following:")
+                        for err in val_errors:
+                            st.markdown(f"- {err}")
                     else:
                         try:
-                            # Store AWS credentials in api_key_encrypted field
-                            # Format: "access_key:secret_key:region"
-                            api_key_value = f"{aws_access_key}:{aws_secret_key}:{aws_region}"
                             mailbox_id = pool.add_mailbox(
                                 name=name,
                                 email=email,
                                 provider=provider,
-                                smtp_host="",  # Not used for API providers
-                                smtp_port=0,   # Not used for API providers
-                                smtp_username="",  # Not used for API providers
-                                smtp_password="",  # Not used for API providers
-                                api_key=api_key_value,  # Store AWS credentials here
-                                daily_limit=daily_limit
+                                smtp_host="",
+                                smtp_port=0,
+                                smtp_username="",
+                                smtp_password="",
+                                api_key=api_key_value,
+                                daily_limit=daily_limit,
                             )
                             st.success(f"✅ AWS SES mailbox added! ID: {mailbox_id}")
                             st.info("💡 Make sure your email is verified in AWS SES Console!")
                             st.rerun()
+                        except ValueError as e:
+                            st.error(f"❌ {e}")
                         except Exception as e:
                             st.error(f"❌ Error adding mailbox: {str(e)}")
                 else:
-                    # SMTP providers
-                    if not name or not email or not smtp_password:
-                        st.error("Please fill in all required fields")
+                    ok, val_errors, norm = validate_smtp_mailbox(
+                        name=name,
+                        email=email,
+                        smtp_host=smtp_host or "",
+                        smtp_port=smtp_port,
+                        smtp_username=smtp_username or "",
+                        smtp_password=smtp_password or "",
+                        daily_limit=daily_limit,
+                        provider=provider,
+                        smtp_encryption=smtp_encryption,
+                    )
+                    if not ok:
+                        st.error("Please fix the following:")
+                        for err in val_errors:
+                            st.markdown(f"- {err}")
                     else:
                         try:
                             mailbox_id = pool.add_mailbox(
-                                name=name,
-                                email=email,
-                                provider=provider,
-                                smtp_host=smtp_host,
-                                smtp_port=int(smtp_port),
-                                smtp_username=smtp_username or email,
-                                smtp_password=smtp_password,
-                                daily_limit=daily_limit
+                                name=norm["name"],
+                                email=norm["email"],
+                                provider=norm["provider"],
+                                smtp_host=norm["smtp_host"],
+                                smtp_port=norm["smtp_port"],
+                                smtp_username=norm["smtp_username"] or norm["email"],
+                                smtp_password=norm["smtp_password"],
+                                daily_limit=norm["daily_limit"],
+                                smtp_encryption=norm["smtp_encryption"],
                             )
                             st.success(f"✅ Mailbox added! ID: {mailbox_id}")
                             st.rerun()
+                        except ValueError as e:
+                            st.error(f"❌ {e}")
                         except Exception as e:
                             st.error(f"❌ Error adding mailbox: {str(e)}")
         
@@ -278,11 +328,22 @@ def render_email_sender_page():
             # Display mailboxes in a nice table
             mb_data = []
             for mb in mailboxes:
+                _tls = str(mb.get("smtp_encryption") or "auto").lower()
+                _tls_short = {"auto": "Auto", "starttls": "STARTTLS", "ssl": "SSL"}.get(
+                    _tls, "Auto"
+                )
+                _host = (mb.get("smtp_host") or "").strip()
+                _port = mb.get("smtp_port")
+                _endpoint = (
+                    f"{_host}:{_port}" if _host else "—"
+                )
                 mb_data.append({
                     "ID": mb['id'],
                     "Name": mb['name'],
                     "Email": mb['email'],
                     "Provider": mb['provider'].upper(),
+                    "SMTP": _endpoint[:56] + ("…" if len(_endpoint) > 56 else ""),
+                    "TLS": _tls_short,
                     "Status": "✅ Active" if mb['is_active'] else "❌ Inactive",
                     "Sent Today": f"{mb['sent_today']}/{mb['daily_limit']}",
                     "Total Sent": mb['sent_total'],
@@ -293,34 +354,67 @@ def render_email_sender_page():
             df = pd.DataFrame(mb_data)
             st.dataframe(df, use_container_width=True, hide_index=True)
             
-            # Mailbox Actions
+            # Mailbox Actions — pick from list (no manual ID typing)
             st.markdown("#### 🔧 Mailbox Actions")
+            st.caption(
+                "Choose the mailbox below, then **Test Connection** or **Deactivate**. "
+                "The same selection is used for both buttons."
+            )
+            _by_id = {int(m["id"]): m for m in mailboxes}
+            _ids_sorted = sorted(_by_id.keys())
+
+            def _mailbox_picker_label(mid: int) -> str:
+                m = _by_id[mid]
+                badge = "✅ active" if m.get("is_active") else "⏸️ inactive"
+                em = str(m.get("email") or "")
+                if len(em) > 44:
+                    em = em[:41] + "…"
+                name = str(m.get("name") or "")[:32]
+                return f"#{mid} · {name} · {em} · {badge}"
+
+            selected_mb_id = st.selectbox(
+                "Mailbox",
+                options=_ids_sorted,
+                format_func=_mailbox_picker_label,
+                key="mb_actions_select",
+            )
+
             col1, col2, col3 = st.columns(3)
-            
+
             with col1:
-                test_mb_id = st.number_input("Test Mailbox ID", min_value=1, value=1, key="test_mb_id")
-                if st.button("🔍 Test Connection", use_container_width=True):
-                    success, message = pool.test_connection(int(test_mb_id))
+                if st.button("🔍 Test Connection", use_container_width=True, key="btn_mailbox_test"):
+                    success, message = pool.test_connection(int(selected_mb_id))
                     if success:
-                        st.success(f"✅ Mailbox #{test_mb_id} connection OK! {message}")
+                        st.success(f"✅ Mailbox #{selected_mb_id}: {message}")
                     else:
-                        st.error(f"❌ Mailbox #{test_mb_id} connection failed: {message}")
-            
+                        st.error(
+                            f"❌ Mailbox #{selected_mb_id}: connection failed — open **Details** below."
+                        )
+                        with st.expander("Details", expanded=True):
+                            st.markdown(message)
+
             with col2:
-                deactivate_mb_id = st.number_input("Deactivate Mailbox ID", min_value=1, value=1, key="deactivate_mb_id")
-                if st.button("⏸️ Deactivate", use_container_width=True):
-                    try:
-                        pool.deactivate_mailbox(int(deactivate_mb_id))
-                        st.success(f"✅ Mailbox #{deactivate_mb_id} deactivated")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"❌ Error: {str(e)}")
-            
+                if st.button("⏸️ Deactivate", use_container_width=True, key="btn_mailbox_deactivate"):
+                    picked = _by_id.get(int(selected_mb_id))
+                    if picked and not picked.get("is_active"):
+                        st.warning(f"Mailbox #{selected_mb_id} is already inactive.")
+                    else:
+                        try:
+                            pool.deactivate_mailbox(int(selected_mb_id))
+                            st.success(f"✅ Mailbox #{selected_mb_id} deactivated")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Error: {str(e)}")
+
             with col3:
                 st.caption("**Total Capacity:**")
                 total_capacity = sum(mb['daily_limit'] for mb in mailboxes if mb['is_active'])
                 total_sent_today = sum(mb['sent_today'] for mb in mailboxes if mb['is_active'])
-                st.metric("", f"{total_sent_today}/{total_capacity}", f"{total_capacity - total_sent_today} remaining")
+                st.metric(
+                    "Pool usage (sent / limit)",
+                    f"{total_sent_today}/{total_capacity}",
+                    f"{total_capacity - total_sent_today} remaining",
+                )
     
     # ── TAB 2: Create Campaign ───────────────────────────────────────────────
     with tab2:
@@ -607,10 +701,26 @@ def render_email_sender_page():
                 
                 selected_mailbox_id = None
                 if mailbox_option == "Use specific mailbox":
-                    mb_choices = {f"{mb['name']} ({mb['email']}) - {mb['sent_today']}/{mb['daily_limit']} remaining": mb['id'] 
-                                 for mb in active_mailboxes}
-                    selected_mb_name = st.selectbox("Select Mailbox", list(mb_choices.keys()), key="select_mb")
-                    selected_mailbox_id = mb_choices[selected_mb_name]
+                    _camp_ids = sorted(int(m["id"]) for m in active_mailboxes)
+                    _camp_by_id = {int(m["id"]): m for m in active_mailboxes}
+
+                    def _campaign_mb_label(mid: int) -> str:
+                        m = _camp_by_id[mid]
+                        em = str(m.get("email") or "")
+                        if len(em) > 40:
+                            em = em[:37] + "…"
+                        return (
+                            f"#{mid} · {m.get('name', '')} · {em} · "
+                            f"{m.get('sent_today', 0)}/{m.get('daily_limit', 0)} today"
+                        )
+
+                    selected_mailbox_id = st.selectbox(
+                        "Mailbox to send from",
+                        options=_camp_ids,
+                        format_func=_campaign_mb_label,
+                        key="select_mb_id",
+                        help="Same IDs as the Mailboxes table above.",
+                    )
             
             # Create Campaign Button
             st.markdown("#### 4️⃣ Start Campaign")

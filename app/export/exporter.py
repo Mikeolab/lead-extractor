@@ -3,9 +3,11 @@ Export Module
 Exports leads to CSV and Excel formats.
 """
 from __future__ import annotations
+import re
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+from email_validator import EmailNotValidError, validate_email
 from app.config import EXPORT_DIR
 
 
@@ -62,6 +64,118 @@ def leads_to_dataframe(leads: list[dict], columns: list[str] | None = None) -> p
 
     df = df.rename(columns={k: column_map.get(k, k) for k in df.columns if k in column_map})
     return df
+
+
+def _coerce_email_string(s: str) -> str | None:
+    """Strip mailto:, angle brackets, trailing punctuation — one candidate string."""
+    t = (s or "").strip().replace("\n", " ").replace("\r", "")
+    if not t or "@" not in t:
+        return None
+    if t.lower().startswith("mailto:"):
+        t = t[7:].split("?")[0].strip()
+    m = re.search(r"<([a-zA-Z0-9._%+\-]+@[^>\s]+)>", t)
+    if m:
+        t = m.group(1).strip()
+    t = t.rstrip(".,;)>]\"'").strip()
+    return t if "@" in t else None
+
+
+def normalize_email_cell_to_addresses(raw: str | None) -> list[str]:
+    """
+    Parse one database `email` cell into 0..N addresses (lowercased, trailing dot stripped).
+    Handles comma/space-separated lists and messy PDF extractions the same way as extraction.
+    """
+    if raw is None or not str(raw).strip():
+        return []
+    s = str(raw).strip()
+    from app.extractors.email_extractor import extract_emails
+
+    found = extract_emails(s, "")
+    if found:
+        return found
+    coerced = _coerce_email_string(s)
+    if not coerced:
+        return []
+    found2 = extract_emails(coerced, "")
+    if found2:
+        return found2
+    c = coerced.lower().strip().rstrip(".")
+    return [c] if "@" in c and "." in c.split("@", 1)[-1] else []
+
+
+def expand_merged_leads_per_email_field(merged: list[dict]) -> list[dict]:
+    """
+    When a single lead row's email field contains multiple addresses, split into one row per
+    address (same contact fields) so Unique / Unique valid behave intuitively.
+    """
+    expanded: list[dict] = []
+    for l in merged:
+        addrs = normalize_email_cell_to_addresses(l.get("email"))
+        if not addrs:
+            row = dict(l)
+            row["email"] = (l.get("email") or "").strip() if isinstance(l.get("email"), str) else ""
+            expanded.append(row)
+            continue
+        if len(addrs) == 1:
+            row = dict(l)
+            row["email"] = addrs[0]
+            expanded.append(row)
+            continue
+        for addr in addrs:
+            row = dict(l)
+            row["email"] = addr
+            expanded.append(row)
+    return expanded
+
+
+def filter_merged_leads_for_export(
+    merged: list[dict],
+    *,
+    use_full: bool,
+    use_validation: bool,
+) -> tuple[list[dict], dict[str, int]]:
+    """
+    Same pipeline for Saved Leads and Live "saved sessions" merge:
+    - Full: return rows as-is (no split, no dedupe).
+    - Unique: split multi-address cells, dedupe by normalized email.
+    - Unique valid: same as Unique plus email_validator (check_deliverability=False).
+    """
+    stats: dict[str, int] = {
+        "merged_raw": len(merged),
+        "rows_after_split": len(merged),
+        "no_email_count": 0,
+        "invalid_count": 0,
+        "dup_count": 0,
+    }
+    if use_full:
+        return list(merged), stats
+
+    work = expand_merged_leads_per_email_field(merged)
+    stats["rows_after_split"] = len(work)
+
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for l in work:
+        e = (l.get("email") or "").strip()
+        if not e or "@" not in e:
+            stats["no_email_count"] += 1
+            continue
+        norm = e.lower().rstrip(".")
+        if use_validation:
+            try:
+                validated = validate_email(norm, check_deliverability=False)
+                norm = validated.email
+            except EmailNotValidError:
+                stats["invalid_count"] += 1
+                continue
+        if norm not in seen:
+            seen.add(norm)
+            l_copy = dict(l)
+            l_copy["email"] = norm
+            unique.append(l_copy)
+        else:
+            stats["dup_count"] += 1
+    return unique, stats
 
 
 def export_to_csv(leads: list[dict], filename: str = "", columns: list[str] | None = None) -> Path:

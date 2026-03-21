@@ -14,6 +14,9 @@ from urllib.parse import urljoin, urlparse
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.config import REQUEST_TIMEOUT, MAX_CONCURRENT_SCRAPES, USER_AGENT
+from app.utils.pdf_logging import suppress_pdfminer_color_warnings
+
+suppress_pdfminer_color_warnings()
 
 warnings.filterwarnings("ignore", category=UserWarning)
 

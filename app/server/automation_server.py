@@ -19,7 +19,6 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, Page, Browser
 from urllib.parse import quote_plus, urlparse, parse_qs, unquote
-import pdfplumber
 import httpx
 
 
@@ -55,17 +54,43 @@ def is_rdp_session() -> bool:
     
     return False
 
-# Import extractors and database
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Package root on path, then pdfplumber + extractors
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from app.utils.pdf_logging import suppress_pdfminer_color_warnings
+
+suppress_pdfminer_color_warnings()
+import pdfplumber
+
 from app.extractors.email_extractor import extract_emails
 from app.extractors.name_extractor import extract_contact_names, extract_names_from_email
 from app.extractors.phone_extractor import extract_phones
-from app.export.pdf_exporter import export_to_pdf
 from app.database.db import save_search, save_leads
-from app.config import EXPORT_DIR
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+def _run_db_retention_on_startup():
+    """Prune old searches/leads (30d default) — throttled so multiple workers don't hammer DB."""
+    try:
+        from app.database.db import maybe_prune_stale_searches
+
+        r = maybe_prune_stale_searches(interval_hours=24.0)
+        if r and not r.get("skipped") and (
+            r.get("searches_deleted", 0) or r.get("leads_deleted", 0)
+        ):
+            print(
+                f"[DB] Retention prune removed {r.get('searches_deleted', 0)} session(s), "
+                f"{r.get('leads_deleted', 0)} lead row(s)",
+                file=sys.stderr,
+                flush=True,
+            )
+    except Exception as e:
+        print(f"[DB] Retention prune skipped: {e}", file=sys.stderr, flush=True)
 
 # CORS for Streamlit
 app.add_middleware(
@@ -84,6 +109,7 @@ class AutomationManager:
         self.active_connections: List[WebSocket] = []
         self.browser: Optional[Browser] = None
         self._persistent_context = None  # For macOS launch_persistent_context
+        self._context = None  # BrowserContext from new_context (must close or window can linger)
         self.page: Optional[Page] = None
         self.playwright = None
         self.is_running = False
@@ -100,6 +126,47 @@ class AutomationManager:
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
+
+    async def shutdown_playwright(self) -> list[str]:
+        """
+        Close page, browser context, browser, and Playwright so the OS window exits.
+        Safe to call multiple times (e.g. Stop button + run_automation finally).
+        """
+        warnings: list[str] = []
+        try:
+            if self.page:
+                try:
+                    await self.page.close()
+                except Exception as e:
+                    warnings.append(f"page:{str(e)[:40]}")
+                self.page = None
+            if getattr(self, "_context", None):
+                try:
+                    await self._context.close()
+                except Exception as e:
+                    warnings.append(f"context:{str(e)[:40]}")
+                self._context = None
+            if getattr(self, "_persistent_context", None):
+                try:
+                    await self._persistent_context.close()
+                except Exception as e:
+                    warnings.append(f"persistent:{str(e)[:40]}")
+                self._persistent_context = None
+            if self.browser:
+                try:
+                    await self.browser.close()
+                except Exception as e:
+                    warnings.append(f"browser:{str(e)[:40]}")
+                self.browser = None
+            if self.playwright:
+                try:
+                    await self.playwright.stop()
+                except Exception as e:
+                    warnings.append(f"playwright:{str(e)[:40]}")
+                self.playwright = None
+        except Exception as e:
+            warnings.append(f"shutdown:{str(e)[:50]}")
+        return warnings
 
     async def broadcast(self, message: dict):
         """Send message to all connected clients."""
@@ -328,6 +395,7 @@ class AutomationManager:
         self.is_running = True
         self.stop_flag = False
         all_leads = []
+        master_search_id = None  # One DB session for whole run (set after queue init)
         total_leads_extracted = 0  # Track total leads for real-time updates
         self._event_loop = asyncio.get_running_loop()
         self._browser_closed_completion_sent = False
@@ -492,14 +560,46 @@ class AutomationManager:
             session_start_time = datetime.now()
             self.all_leads_buffer = []  # Reset buffer
 
-            # Query queue: extend when DDG runs out of pages and we need more for target (e.g. 10k)
+            # Query queue: extend with extra phrases when DDG yields few PDFs / pages end — scales toward 100k+ targets
             DDG_QUERY_VARIATIONS = [
-                " list", " directory", " email directory", " staff directory",
-                " contact list", " member directory", " phone directory", " directory contact",
+                " list", " directory", " roster", " members", " membership",
+                " board of directors", " committee", " officers", " chapter",
+                " email directory", " staff directory", " contact list",
+                " member directory", " phone directory", " directory contact",
+                " annual report", " meeting minutes", " registration form",
+                " volunteers", " club", " association", " foundation",
+                " nonprofit", " pdf contact", " public records",
+                " state filing", " tax exempt", " organization",
+                " leadership", " team", " contacts page",
+                " site:org", " filetype:pdf intext:email",
             ]
             query_queue = list(queries)
+            initial_queries_frozen = frozenset((q or "").strip() for q in queries if (q or "").strip())
             variation_idx = 0
             query_idx = 0
+
+            # One DB search row per automation *run* (single Start): all query variants + auto-variations
+            # share the same session so Saved Leads doesn't show 6 fragments for one logical job.
+            q_parts = [(q or "").strip() for q in queries if (q or "").strip()]
+            if not q_parts:
+                session_label = "(no query)"
+            elif len(q_parts) == 1:
+                session_label = q_parts[0]
+            else:
+                session_label = q_parts[0][:120] + f" (+{len(q_parts) - 1} batch lines)"
+            try:
+                master_search_id = save_search(session_label, num_results=0)
+                self.current_session_id = master_search_id
+                await self.broadcast({
+                    "type": "status",
+                    "message": f"💾 Session #{master_search_id} — all query passes in this run save here (one row)",
+                })
+            except Exception as e:
+                await self.broadcast({
+                    "type": "status",
+                    "message": f"⚠️ Database error (session): {str(e)[:50]}. Leads may not persist.",
+                })
+                self.current_session_id = None
 
             # Init script for anti-detection (reused when reloading context)
             _init_script = """
@@ -523,6 +623,8 @@ class AutomationManager:
             while query_queue and not self.stop_flag:
                 query = query_queue.pop(0)
                 query_idx += 1
+                if (query or "").strip() in initial_queries_frozen:
+                    variation_idx = 0
                 if self.stop_flag:
                     await self.broadcast({"type": "status", "message": "🛑 Stopped by user"})
                     break
@@ -599,21 +701,13 @@ class AutomationManager:
                         "message": f"--- Query {query_idx} (total in queue: {total_queued}): \"{query[:60]}{'...' if len(query) > 60 else ''}\" ---",
                     })
 
-                    # Create search record in database
-                    try:
-                        search_id = save_search(query, num_results=0)
-                        self.current_session_id = search_id
+                    # Reuse the same DB session for every queue item (variants included)
+                    search_id = master_search_id
+                    if master_search_id:
                         await self.broadcast({
                             "type": "status",
-                            "message": f"💾 Created search session #{search_id}",
+                            "message": f"📎 Pass #{query_idx} → session #{master_search_id} (cumulative save)",
                         })
-                    except Exception as e:
-                        await self.broadcast({
-                            "type": "status",
-                            "message": f"⚠️ Database error: {str(e)[:50]}. Continuing...",
-                        })
-                        search_id = None
-                        self.current_session_id = None
 
                     query_leads = []
 
@@ -629,6 +723,8 @@ class AutomationManager:
                         processed_urls = set()
                         pdf_count = 0
                         no_more_ddg_pages = False
+                        ddg_page = 0
+                        ddg_flow_error = False
                         try:
                             for ddg_page in range(1, max_pages + 1):
                                 if self.stop_flag:
@@ -720,8 +816,13 @@ class AutomationManager:
                                                 total_leads_extracted += len(pdf_leads)
                                                 await self.broadcast({"type": "lead_count", "count": total_leads_extracted, "target": target_leads})
                                                 try:
-                                                    save_leads(search_id, query_leads, replace=True)
-                                                    await self.broadcast({"type": "status", "message": f"  💾 Saved ({len(query_leads)} leads)"})
+                                                    if master_search_id:
+                                                        save_leads(
+                                                            master_search_id,
+                                                            list(all_leads) + query_leads,
+                                                            replace=True,
+                                                        )
+                                                    await self.broadcast({"type": "status", "message": f"  💾 Saved ({len(query_leads)} this pass, {len(all_leads) + len(query_leads)} cumulative)"})
                                                 except Exception:
                                                     pass
                                         except Exception as e:
@@ -731,7 +832,8 @@ class AutomationManager:
                                 await self.broadcast({"type": "status", "message": "⚠️ No DuckDuckGo results found"})
                         except Exception as e:
                             await self.broadcast({"type": "status", "message": f"❌ DuckDuckGo error: {str(e)[:60]}"})
-                            continue
+                            ddg_flow_error = True
+                            # Do not `continue` — we still want query variations below when results were poor.
                         # DDG done - finalize this query here and skip Google flow.
                         # This prevents accidental fallback to Google/CAPTCHA when DDG is selected.
                         if query_leads:
@@ -752,22 +854,49 @@ class AutomationManager:
                                 "type": "status",
                                 "message": f"⚠️ Query {query_idx}: No leads extracted from DuckDuckGo",
                             })
-                        # When DDG runs out of pages, add query variations if:
-                        # - User set a target and we're under it, OR
-                        # - Target is 0: always add variations (run until no more pages, no artificial cap)
-                        should_add_variations = no_more_ddg_pages and variation_idx < len(DDG_QUERY_VARIATIONS)
+                        # Add query variations when: pages exhausted OR yield is low vs target (~10k soft floor)
                         under_target = target_leads > 0 and total_leads_extracted < target_leads
-                        no_limit_mode = target_leads == 0  # Target 0 = no cap, keep going
-                        max_auto_variations = 5
-                        if should_add_variations and (under_target or no_limit_mode) and variation_idx < max_auto_variations:
+                        no_limit_mode = target_leads == 0
+                        max_auto_variations = min(60, len(DDG_QUERY_VARIATIONS))
+                        yield_threshold = (
+                            min(10000, max(500, target_leads // 10))
+                            if target_leads > 0
+                            else 2500
+                        )
+                        under_yield = len(query_leads) < yield_threshold and (
+                            target_leads == 0 or len(query_leads) < int(target_leads * 0.95)
+                        )
+                        can_add = (
+                            variation_idx < len(DDG_QUERY_VARIATIONS)
+                            and variation_idx < max_auto_variations
+                            and (under_target or no_limit_mode)
+                        )
+                        # Expand when: no more SERP pages, or finished max_pages with low yield, or DDG crashed with 0 leads
+                        if (
+                            can_add
+                            and not self.stop_flag
+                            and (
+                                no_more_ddg_pages
+                                or (under_yield and ddg_page == max_pages)
+                                or (ddg_flow_error and len(query_leads) == 0)
+                            )
+                        ):
                             base = q.replace(" filetype:pdf", "").replace(" filetype: pdf", "").strip()
-                            new_q = base + DDG_QUERY_VARIATIONS[variation_idx] + " filetype:pdf"
+                            suffix = DDG_QUERY_VARIATIONS[variation_idx].strip()
                             variation_idx += 1
+                            if "filetype:" in suffix.lower():
+                                new_q = (base + " " + suffix).replace("  ", " ").strip()
+                            else:
+                                new_q = (base + " " + suffix + " filetype:pdf").replace("  ", " ").strip()
                             query_queue.append(new_q)
-                            reason = f"reach {target_leads} leads" if target_leads > 0 else "get more leads (got few results)"
+                            reason = (
+                                f"reach {target_leads} leads (soft floor {yield_threshold}/pass)"
+                                if target_leads > 0
+                                else f"expand search (floor {yield_threshold} leads/pass)"
+                            )
                             await self.broadcast({
                                 "type": "status",
-                                "message": f"  🔄 DDG exhausted pages — adding variation to {reason}: \"{new_q[:55]}...\"",
+                                "message": f"  🔄 Adding query variation ({reason}): \"{new_q[:55]}...\"",
                             })
                         await self.broadcast({"type": "leads", "data": query_leads})
                         continue
@@ -953,6 +1082,7 @@ class AutomationManager:
                             pass
 
                     # Extract results from multiple pages and PROCESS PDFs IMMEDIATELY
+                    google_no_more_pages = False
                     for page_num in range(1, max_pages + 1):
                         if self.stop_flag:
                             break
@@ -982,9 +1112,11 @@ class AutomationManager:
                                             await self.broadcast({"type": "screenshot", "data": screenshot})
                                 else:
                                     await self.broadcast({"type": "status", "message": "⚠️ No more pages"})
+                                    google_no_more_pages = True
                                     break
                             except Exception:
                                 await self.broadcast({"type": "status", "message": "⚠️ Could not navigate to next page"})
+                                google_no_more_pages = True
                                 break
 
                         # STEP 4: Extract results and CLICK ALL PDFs (query already filters for filetype:pdf)
@@ -1196,8 +1328,16 @@ class AutomationManager:
                                             
                                             # Save immediately after each PDF (resilient - never lose leads)
                                             try:
-                                                save_leads(search_id, query_leads, replace=True)
-                                                await self.broadcast({"type": "status", "message": f"  💾 Saved to DB ({len(query_leads)} total for this query)"})
+                                                if master_search_id:
+                                                    save_leads(
+                                                        master_search_id,
+                                                        list(all_leads) + query_leads,
+                                                        replace=True,
+                                                    )
+                                                await self.broadcast({
+                                                    "type": "status",
+                                                    "message": f"  💾 Saved to DB ({len(query_leads)} this pass, {len(all_leads) + len(query_leads)} cumulative)",
+                                                })
                                             except Exception as es:
                                                 await self.broadcast({"type": "status", "message": f"  ⚠️ Save error: {str(es)[:40]}"})
                                         else:
@@ -1259,7 +1399,7 @@ class AutomationManager:
                     if self.stop_flag:
                         break
 
-                    # Save leads after each query (CRITICAL: Save to database FIRST, then PDF)
+                    # Save leads after each query (database only — no auto file export)
                     if query_leads:
                         all_leads.extend(query_leads)
                         self.all_leads_buffer.extend(query_leads)  # Keep buffer updated
@@ -1272,12 +1412,15 @@ class AutomationManager:
                             "target": target_leads,
                         })
                         
-                        # SAVE TO DATABASE FIRST (incremental save)
+                        # SAVE TO DATABASE (full cumulative list for this run)
                         try:
-                            saved_count = save_leads(search_id, query_leads)
+                            if master_search_id:
+                                saved_count = save_leads(master_search_id, all_leads, replace=True)
+                            else:
+                                saved_count = 0
                             await self.broadcast({
                                 "type": "status",
-                                "message": f"💾 Saved {saved_count} leads to database (session #{search_id}) | Total: {total_leads_extracted} leads",
+                                "message": f"💾 Saved {saved_count} leads to database (session #{master_search_id}) | Total extracted: {total_leads_extracted}",
                             })
                         except Exception as e:
                             await self.broadcast({
@@ -1299,43 +1442,66 @@ class AutomationManager:
                             self.stop_flag = True
                             break
 
-                        # Save to PDF file (with retry)
-                        saved = False
-                        for retry in range(2):
-                            try:
-                                EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                safe_query = query.replace(" ", "_").replace("@", "at").replace("/", "_")[:30]
-                                filename = f"leads_query{query_idx + 1}_{safe_query}_{timestamp}.pdf"
-                                filepath = export_to_pdf(query_leads, query=query, filename=filename)
-                                
-                                await self.broadcast({
-                                    "type": "status",
-                                    "message": f"💾 PDF saved: {filepath}",
-                                })
-                                await self.broadcast({
-                                    "type": "file_saved",
-                                    "path": str(filepath),
-                                    "query": query,
-                                    "count": len(query_leads),
-                                })
-                                saved = True
-                                break
-                            except Exception as e:
-                                if retry == 0:
-                                    await asyncio.sleep(1)  # Retry once
-                                else:
-                                    await self.broadcast({
-                                        "type": "status",
-                                        "message": f"⚠️ PDF save error: {str(e)[:60]}",
-                                    })
-
+                        # No automatic PDF/CSV export — sessions are in the DB; user exports from the app UI.
+                        await self.broadcast({
+                            "type": "status",
+                            "message": "📁 Leads are in the database for this session — use **Saved sessions for this query** or **Saved Leads** to validate/download when you want.",
+                        })
                         await self.broadcast({"type": "leads", "data": query_leads})
                     else:
                         await self.broadcast({
                             "type": "status",
                             "message": f"⚠️ Query {query_idx + 1}: No leads extracted",
                         })
+
+                    # Google: rotate query wording when results are thin (same variation list as DuckDuckGo)
+                    if search_engine != "duckduckgo":
+                        gq = query.strip()
+                        g_base = (
+                            gq.replace(" filetype:pdf", "")
+                            .replace(" filetype: pdf", "")
+                            .strip()
+                        )
+                        under_target_g = target_leads > 0 and total_leads_extracted < target_leads
+                        no_limit_g = target_leads == 0
+                        max_auto_g = min(60, len(DDG_QUERY_VARIATIONS))
+                        yield_thr_g = (
+                            min(10000, max(500, target_leads // 10))
+                            if target_leads > 0
+                            else 2500
+                        )
+                        under_yield_g = len(query_leads) < yield_thr_g and (
+                            target_leads == 0 or len(query_leads) < int(target_leads * 0.95)
+                        )
+                        can_add_g = (
+                            variation_idx < len(DDG_QUERY_VARIATIONS)
+                            and variation_idx < max_auto_g
+                            and (under_target_g or no_limit_g)
+                        )
+                        if (
+                            can_add_g
+                            and not self.stop_flag
+                            and (
+                                google_no_more_pages
+                                or (under_yield_g and page_num == max_pages)
+                            )
+                        ):
+                            suffix_g = DDG_QUERY_VARIATIONS[variation_idx].strip()
+                            variation_idx += 1
+                            if "filetype:" in suffix_g.lower():
+                                new_qg = (g_base + " " + suffix_g).replace("  ", " ").strip()
+                            else:
+                                new_qg = (g_base + " " + suffix_g + " filetype:pdf").replace("  ", " ").strip()
+                            query_queue.append(new_qg)
+                            reason_g = (
+                                f"reach {target_leads} leads (Google)"
+                                if target_leads > 0
+                                else "expand Google search"
+                            )
+                            await self.broadcast({
+                                "type": "status",
+                                "message": f"  🔄 Adding query variation ({reason_g}): \"{new_qg[:55]}...\"",
+                            })
 
                     await self.broadcast({"type": "status", "message": ""})
                 
@@ -1355,11 +1521,11 @@ class AutomationManager:
                     # Log full error for debugging
                     print(f"Query {query_idx + 1} error: {error_trace}")
                     # Save any leads we got before the error (replace=True - full replace for this search)
-                    if 'query_leads' in locals() and query_leads and 'search_id' in locals() and search_id:
+                    if 'query_leads' in locals() and query_leads and master_search_id:
                         try:
-                            save_leads(search_id, query_leads, replace=True)
                             all_leads.extend(query_leads)
                             self.all_leads_buffer.extend(query_leads)
+                            save_leads(master_search_id, all_leads, replace=True)
                         except Exception:
                             pass
                     continue
@@ -1392,28 +1558,6 @@ class AutomationManager:
                         "message": f"⚠️ Final DB update error: {str(e)[:60]}",
                     })
             
-            # Save final combined PDF
-            if all_leads:
-                try:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"all_leads_{timestamp}.pdf"
-                    filepath = export_to_pdf(all_leads, query="All Queries", filename=filename)
-                    await self.broadcast({
-                        "type": "status",
-                        "message": f"💾 Final combined PDF saved: {filepath}",
-                    })
-                    await self.broadcast({
-                        "type": "file_saved",
-                        "path": str(filepath),
-                        "query": "All Queries",
-                        "count": len(all_leads),
-                    })
-                except Exception as e:
-                    await self.broadcast({
-                        "type": "status",
-                        "message": f"⚠️ Final PDF save error: {str(e)[:60]}",
-                    })
-
             await self.broadcast({"type": "complete", "data": all_leads})
 
         except Exception as e:
@@ -1425,28 +1569,11 @@ class AutomationManager:
                 "type": "error",
                 "message": f"❌ Automation error: {error_msg}",
             })
-            # CRITICAL: Save buffer to DB and PDF on error (never lose leads)
+            # CRITICAL: Save buffer to DB on error (never lose leads)
             if self.all_leads_buffer and self.current_session_id:
                 try:
                     save_leads(self.current_session_id, self.all_leads_buffer, replace=True)
                     await self.broadcast({"type": "status", "message": f"💾 Saved {len(self.all_leads_buffer)} leads to database (recovery)"})
-                except Exception:
-                    pass
-            if self.all_leads_buffer:
-                try:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    filename = f"leads_recovered_{timestamp}.pdf"
-                    filepath = export_to_pdf(self.all_leads_buffer, query="Recovered Leads", filename=filename)
-                    await self.broadcast({
-                        "type": "status",
-                        "message": f"💾 Recovered leads saved: {filepath}",
-                    })
-                    await self.broadcast({
-                        "type": "file_saved",
-                        "path": str(filepath),
-                        "query": "Recovered Leads",
-                        "count": len(self.all_leads_buffer),
-                    })
                 except Exception:
                     pass
         finally:
@@ -1470,28 +1597,8 @@ class AutomationManager:
                         "message": f"⚠️ Final save error: {str(e)[:60]}",
                     })
             
-            # Cleanup browser (AFTER saving, BEFORE completion signal)
-            cleanup_errors = []
-            try:
-                if self.page:
-                    await self.page.close()
-            except Exception as e:
-                cleanup_errors.append(f"Page close: {str(e)[:30]}")
-            try:
-                if getattr(self, '_persistent_context', None):
-                    await self._persistent_context.close()
-            except Exception as e:
-                cleanup_errors.append(f"Context close: {str(e)[:30]}")
-            try:
-                if self.browser:
-                    await self.browser.close()
-            except Exception as e:
-                cleanup_errors.append(f"Browser close: {str(e)[:30]}")
-            try:
-                if self.playwright:
-                    await self.playwright.stop()
-            except Exception as e:
-                cleanup_errors.append(f"Playwright stop: {str(e)[:30]}")
+            # Cleanup browser (closes context + browser so external window exits)
+            cleanup_errors = await self.shutdown_playwright()
             
             # CRITICAL: Always send completion signal, even on error
             # Set is_running to False FIRST so UI knows it's done
@@ -1590,12 +1697,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif command == "stop":
                     manager.stop_flag = True
                     manager.is_running = False  # Force stop
-                    await manager.broadcast({"type": "status", "message": "🛑 Stop requested - saving all leads and stopping automation..."})
+                    await manager.broadcast({"type": "status", "message": "🛑 Stop requested - saving leads and closing browser..."})
                     
                     # Save all leads in buffer before stopping
                     if manager.all_leads_buffer and manager.current_session_id:
                         try:
-                            saved_count = save_leads(manager.current_session_id, manager.all_leads_buffer)
+                            saved_count = save_leads(manager.current_session_id, manager.all_leads_buffer, replace=True)
                             await manager.broadcast({
                                 "type": "status",
                                 "message": f"💾 Saved {saved_count} leads to database before stopping",
@@ -1606,6 +1713,16 @@ async def websocket_endpoint(websocket: WebSocket):
                                 "message": f"⚠️ Error saving leads on stop: {str(e)[:60]}",
                             })
                     
+                    # Close Playwright immediately so the visible browser window exits (run_automation may still unwind)
+                    pw_errs = await manager.shutdown_playwright()
+                    if pw_errs:
+                        await manager.broadcast({
+                            "type": "status",
+                            "message": f"🔚 Browser shutdown: {', '.join(pw_errs[:3])}",
+                        })
+                    else:
+                        await manager.broadcast({"type": "status", "message": "🔚 Browser closed"})
+
                     # Force completion signal with all leads
                     try:
                         await manager.broadcast({
@@ -1626,21 +1743,13 @@ async def websocket_endpoint(websocket: WebSocket):
                     break
 
     except WebSocketDisconnect:
-        # CRITICAL: Save to database AND PDF on disconnect (client closed tab / refreshed)
+        # CRITICAL: Save to database on disconnect (client closed tab / refreshed)
         if manager.all_leads_buffer and manager.current_session_id:
             try:
                 save_leads(manager.current_session_id, manager.all_leads_buffer, replace=True)
                 print(f"💾 Saved {len(manager.all_leads_buffer)} leads to DB on disconnect")
             except Exception as e:
                 print(f"⚠️ DB save on disconnect failed: {e}")
-        if manager.all_leads_buffer:
-            try:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filename = f"leads_disconnect_{timestamp}.pdf"
-                filepath = export_to_pdf(manager.all_leads_buffer, query="Disconnected Leads", filename=filename)
-                print(f"💾 Saved leads to PDF on disconnect: {filepath}")
-            except Exception:
-                pass
         manager.disconnect(websocket)
     except Exception as e:
         print(f"WebSocket error: {e}")

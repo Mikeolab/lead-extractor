@@ -4,6 +4,7 @@ Manages reusable SMTP connections for efficient bulk sending
 """
 from __future__ import annotations
 import smtplib
+import ssl
 import threading
 import time
 from typing import Dict, Optional, List
@@ -14,6 +15,8 @@ _mime_multipart = importlib.import_module('email.mime.multipart')
 MIMEText = _mime_text.MIMEText
 MIMEMultipart = _mime_multipart.MIMEMultipart
 from collections import defaultdict
+
+from app.email.smtp_tls import resolve_connection_mode
 
 
 class SMTPConnectionPool:
@@ -59,16 +62,23 @@ class SMTPConnectionPool:
             # Create new connection if under limit
             if len(self.pools[mailbox_id]) < self.max_connections:
                 try:
-                    conn = smtplib.SMTP(
-                        mailbox_config['smtp_host'],
-                        mailbox_config['smtp_port'],
-                        timeout=30
+                    host = (mailbox_config.get("smtp_host") or "").strip()
+                    port = int(mailbox_config.get("smtp_port") or 587)
+                    user = (mailbox_config.get("smtp_username") or "").strip()
+                    pwd = (mailbox_config.get("smtp_password") or "").strip()
+                    ctx = ssl.create_default_context()
+                    mode = resolve_connection_mode(
+                        mailbox_config.get("smtp_encryption"), port
                     )
-                    conn.starttls()
-                    conn.login(
-                        mailbox_config['smtp_username'],
-                        mailbox_config['smtp_password']
-                    )
+                    # ssl = SMTP_SSL (implicit TLS). starttls = plain socket then STARTTLS.
+                    if mode == "ssl":
+                        conn = smtplib.SMTP_SSL(host, port, timeout=30, context=ctx)
+                    else:
+                        conn = smtplib.SMTP(host, port, timeout=30)
+                        conn.ehlo()
+                        conn.starttls(context=ctx)
+                        conn.ehlo()
+                    conn.login(user, pwd)
                     self.connection_times[id(conn)] = time.time()
                     return conn
                 except Exception as e:

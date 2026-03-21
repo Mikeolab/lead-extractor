@@ -5,6 +5,7 @@ Uses same interface as db.py for SQLite - swap when DATABASE_URL is set.
 from __future__ import annotations
 import os
 import re
+from datetime import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -149,6 +150,7 @@ def _init_tables(conn):
             );
             CREATE INDEX IF NOT EXISTS idx_leads_search_id ON leads(search_id);
             CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email);
+            CREATE INDEX IF NOT EXISTS idx_searches_created_at ON searches(created_at);
             CREATE TABLE IF NOT EXISTS mailboxes (
                 id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -166,7 +168,8 @@ def _init_tables(conn):
                 last_used TIMESTAMP,
                 last_error TEXT,
                 error_count INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                smtp_encryption TEXT DEFAULT 'auto'
             );
             CREATE TABLE IF NOT EXISTS email_campaigns (
                 id SERIAL PRIMARY KEY,
@@ -235,6 +238,12 @@ def _init_tables(conn):
                 cur.execute(f"ALTER TABLE {tbl} ADD COLUMN IF NOT EXISTS {col} INTEGER")
             except psycopg2.ProgrammingError:
                 pass  # Column exists
+        try:
+            cur.execute(
+                "ALTER TABLE mailboxes ADD COLUMN IF NOT EXISTS smtp_encryption TEXT DEFAULT 'auto'"
+            )
+        except psycopg2.ProgrammingError:
+            pass
     conn.commit()
 
 
@@ -299,6 +308,23 @@ def get_recent_searches(limit: int = 20) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_searches_for_query(query_text: str, limit: int = 40) -> list[dict]:
+    if not query_text or not str(query_text).strip():
+        return []
+    key = query_text.strip().lower()
+    conn = _get_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT * FROM searches
+               WHERE LOWER(TRIM(query)) = %s
+               ORDER BY created_at DESC LIMIT %s""",
+            (key, limit),
+        )
+        rows = cur.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
 def get_leads_by_search(search_id: int) -> list[dict]:
     conn = _get_conn()
     with conn.cursor() as cur:
@@ -331,6 +357,33 @@ def delete_search(search_id: int) -> None:
         cur.execute("DELETE FROM searches WHERE id = %s", (search_id,))
     conn.commit()
     conn.close()
+
+
+def prune_old_searches_and_leads_cutoff(cutoff: datetime) -> dict:
+    """Delete searches (and leads) with created_at strictly before cutoff (timezone-aware UTC)."""
+    retention_days = int(os.environ.get("LEADS_RETENTION_DAYS", "30"))
+    conn = _get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS c FROM searches WHERE created_at < %s", (cutoff,))
+        n_search = cur.fetchone()["c"]
+        cur.execute(
+            "SELECT COUNT(*) AS c FROM leads WHERE search_id IN (SELECT id FROM searches WHERE created_at < %s)",
+            (cutoff,),
+        )
+        n_leads = cur.fetchone()["c"]
+        cur.execute(
+            "DELETE FROM leads WHERE search_id IN (SELECT id FROM searches WHERE created_at < %s)",
+            (cutoff,),
+        )
+        cur.execute("DELETE FROM searches WHERE created_at < %s", (cutoff,))
+    conn.commit()
+    conn.close()
+    return {
+        "searches_deleted": n_search,
+        "leads_deleted": n_leads,
+        "retention_days": retention_days,
+        "cutoff_utc": cutoff.isoformat(),
+    }
 
 
 def get_lead_stats() -> dict:

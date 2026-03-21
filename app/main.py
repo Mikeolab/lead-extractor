@@ -4,26 +4,39 @@ Streamlit UI that connects to FastAPI WebSocket server for real-time browser vis
 """
 from __future__ import annotations
 
+import os
 import streamlit as st
 import pandas as pd
 import json
+import sys
 import threading
 import time
 import websocket
 from queue import Queue, Empty
-from datetime import datetime
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List
 
 # Thread-safe ref for WebSocket (Stop button). Session state must NOT be touched from WS thread.
 _ws_client_ref = [None]
 
-from email_validator import validate_email, EmailNotValidError
-
 from app.config import APP_NAME, APP_VERSION, LICENSE_KEY, LICENSE_SECRET, EXPORT_DIR, WEBSOCKET_URL, AUTOMATION_SERVER_URL, PROJECT_ROOT
 from app.license.validator import validate_license
 from app.license.activation_ui import check_license, show_activation_dialog, show_license_status
-from app.database.db import get_all_leads, get_lead_stats
-from app.export.exporter import export_to_csv, export_to_excel, COLUMN_PRESETS, leads_to_dataframe
+from app.database.db import (
+    get_all_leads,
+    get_lead_stats,
+    get_searches_for_queries,
+    get_leads_by_search,
+    maybe_prune_stale_searches,
+)
+from app.export.exporter import (
+    export_to_csv,
+    export_to_excel,
+    COLUMN_PRESETS,
+    leads_to_dataframe,
+    filter_merged_leads_for_export,
+)
 from app.export.pdf_exporter import export_to_pdf
 from app.config_manager import load_settings, save_settings
 from app.email.email_ui import render_email_sender_page
@@ -36,6 +49,12 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Delete lead/search data older than LEADS_RETENTION_DAYS (default 30); runs at most once / 24h
+try:
+    maybe_prune_stale_searches(interval_hours=24.0)
+except Exception:
+    pass
 
 # ─── Custom CSS ──────────────────────────────────────────────────────────────
 st.markdown("""
@@ -165,6 +184,47 @@ st.markdown("""
     .main-content {
         padding-bottom: 80px;
     }
+
+    /* Live extraction — compact status (no full-page flash) */
+    .extraction-status-bar {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 14px;
+        background: linear-gradient(90deg, #eef2ff 0%, #f8fafc 100%);
+        border: 1px solid #c7d2fe;
+        border-radius: 8px;
+        margin-bottom: 10px;
+        font-size: 0.9rem;
+        color: #1e293b;
+    }
+    .live-dot {
+        width: 9px;
+        height: 9px;
+        background: #2563eb;
+        border-radius: 50%;
+        flex-shrink: 0;
+        box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.25);
+        animation: live-dot-pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes live-dot-pulse {
+        0%, 100% { opacity: 1; transform: scale(1); }
+        50% { opacity: 0.45; transform: scale(0.92); }
+    }
+    .extraction-meta {
+        color: #64748b;
+        font-size: 0.82rem;
+    }
+    .extraction-detail {
+        font-size: 0.78rem;
+        color: #475569;
+        margin: -4px 0 10px 0;
+        padding-left: 19px;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -198,6 +258,8 @@ if "current_page" not in st.session_state:
     st.session_state.current_page = "🔍 Live Extractor"
 if "search_engine" not in st.session_state:
     st.session_state.search_engine = st.session_state.settings.get("search_engine", "duckduckgo")
+if "live_queries_for_sessions" not in st.session_state:
+    st.session_state.live_queries_for_sessions = []
 
 
 # ─── WebSocket Client (URL from app.config, supports local + cloud) ───────────
@@ -333,11 +395,13 @@ def drain_ws_queue(msg_queue: Queue) -> bool:
             st.session_state.is_running = False
             st.session_state.needs_refresh = True
             st.session_state.last_update = time.time()
+            st.session_state._terminal_rerun = True
             changed = True
         elif msg_type == "error":
             st.session_state.activity_log.append(f"❌ {data}")
             if "fatal" in str(data).lower() or "crash" in str(data).lower():
                 st.session_state.is_running = False
+                st.session_state._terminal_rerun = True
             st.session_state.needs_refresh = True
             changed = True
         elif msg_type == "connected":
@@ -347,12 +411,255 @@ def drain_ws_queue(msg_queue: Queue) -> bool:
         elif msg_type == "closed":
             st.session_state.websocket_connected = False
             st.session_state.is_running = False
+            st.session_state._terminal_rerun = True
             changed = True
     return changed
 
 
+def _escape_html(s: str) -> str:
+    return (
+        (s or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _render_live_panel_content(*, extracting: bool):
+    """Browser screenshot + activity log + optional extraction banner."""
+    if extracting:
+        n = len(st.session_state.get("extracted_leads", []))
+        last = ""
+        if st.session_state.activity_log:
+            last = str(st.session_state.activity_log[-1])
+        st.markdown(
+            '<div class="extraction-status-bar">'
+            '<span class="live-dot"></span>'
+            "<strong>Extracting</strong>"
+            f'<span class="extraction-meta">{n} lead(s) collected · live updates</span>'
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        if last:
+            st.markdown(
+                f'<div class="extraction-detail" title="{_escape_html(last)}">'
+                f"{_escape_html(last)}</div>",
+                unsafe_allow_html=True,
+            )
+
+    col_browser, col_log = st.columns([1.2, 0.8])
+    with col_browser:
+        st.markdown("### 🖥️ Live Browser View")
+        if st.session_state.current_screenshot:
+            st.image(
+                f"data:image/png;base64,{st.session_state.current_screenshot}",
+                use_container_width=True,
+                caption="Live browser automation",
+            )
+        else:
+            st.info("👆 Click **Start** to see live browser automation…")
+    with col_log:
+        st.markdown("### 📋 Activity Log")
+        log_text = "\n".join(st.session_state.activity_log[-50:])
+        st.markdown(f'<div class="activity-log">{_escape_html(log_text)}</div>', unsafe_allow_html=True)
+
+
+@st.fragment(run_every=timedelta(seconds=1.15))
+def _live_automation_fragment():
+    """Refresh only this block while automation runs — avoids full-page Streamlit flashes."""
+    q = st.session_state.get("ws_message_queue")
+    if q:
+        drain_ws_queue(q)
+    if st.session_state.pop("_terminal_rerun", False):
+        st.rerun()
+    if not st.session_state.is_running:
+        return
+    _render_live_panel_content(extracting=True)
+
+
+def _render_live_query_sessions_panel():
+    """Show all DB sessions matching the current / last-run query text(s) for merge, validate, export."""
+    qs = list(st.session_state.get("live_queries_for_sessions") or [])
+    if not qs:
+        qi = (st.session_state.get("query_input") or "").strip()
+        bq = st.session_state.get("batch_queries") or ""
+        if bq.strip():
+            qs = [x.strip() for x in bq.split("\n") if x.strip()][:10]
+        elif qi:
+            qs = [qi]
+    if not qs:
+        return
+
+    try:
+        matches = get_searches_for_queries(qs, limit=60)
+    except Exception as e:
+        st.caption(f"Could not load saved sessions: {e}")
+        return
+
+    if not matches:
+        return
+
+    st.divider()
+    st.markdown("### 📚 Saved sessions for this query")
+    st.caption(
+        "Every run that used the same query text (after normalization). "
+        "Select sessions, choose **Export mode** (same rules as Saved Leads), then **download or save** manually — "
+        "nothing is exported automatically."
+    )
+
+    options = []
+    opt_to_sid = {}
+    for s in matches:
+        sid = s["id"]
+        n = s.get("num_leads", 0) or 0
+        qshort = str(s.get("query", ""))[:52] + ("…" if len(str(s.get("query", ""))) > 52 else "")
+        ts = str(s.get("created_at", ""))[:19]
+        label = f"#{sid} · {n} leads · {ts} · {qshort}"
+        options.append(label)
+        opt_to_sid[label] = sid
+
+    picked = st.multiselect(
+        "Select sessions to merge",
+        options=options,
+        default=[],
+        key="live_page_session_multiselect",
+    )
+    if not picked:
+        st.info(
+            "Select one or more sessions above. "
+            "**Export mode** uses the same code as Saved Leads: **Full** = all rows as stored; "
+            "**Unique** / **Unique valid** split cells that list several emails, then dedupe (and validate). "
+            "If you still see one row, check the breakdown — often the other rows were **duplicates** of the same address."
+        )
+        return
+
+    selected_ids = [opt_to_sid[l] for l in picked if l in opt_to_sid]
+    merged: list[dict] = []
+    for sid in selected_ids:
+        for row in get_leads_by_search(sid):
+            lead = {
+                "business_name": row.get("business_name", ""),
+                "contact_name": row.get("contact_name", ""),
+                "email": row.get("email", ""),
+                "phone": row.get("phone", ""),
+                "website": row.get("website", ""),
+                "source_url": row.get("source_url", ""),
+                "snippet": row.get("snippet", ""),
+                "_session_id": sid,
+            }
+            merged.append(lead)
+
+    st.metric("Merged leads (raw, selected sessions)", len(merged))
+
+    export_mode = st.radio(
+        "Export mode",
+        [
+            "Full (all leads, no dedup)",
+            "Unique (dedup only, any email with @)",
+            "Unique valid (dedup + strict validation)",
+        ],
+        key="live_query_export_mode",
+        help="Same engine as Saved Leads. Multi-address cells are split before dedupe/validation.",
+    )
+    use_full = "Full" in export_mode
+    use_validation = "valid" in export_mode.lower()
+
+    export_leads, ex_stats = filter_merged_leads_for_export(
+        merged, use_full=use_full, use_validation=use_validation
+    )
+
+    if use_full:
+        st.info(f"📋 {len(export_leads)} leads (full, no dedup)")
+    else:
+        if use_validation:
+            st.success(
+                f"✅ {len(export_leads)} unique valid leads "
+                f"(from {ex_stats['merged_raw']} merged rows → {ex_stats['rows_after_split']} after splitting multi-email cells)"
+            )
+        else:
+            st.success(
+                f"✅ {len(export_leads)} unique leads "
+                f"(from {ex_stats['merged_raw']} merged rows → {ex_stats['rows_after_split']} after split, dedup only)"
+            )
+        with st.expander("📊 Breakdown (why rows were excluded)"):
+            if ex_stats["rows_after_split"] != ex_stats["merged_raw"]:
+                st.markdown(
+                    f"- **Rows after splitting cells:** {ex_stats['rows_after_split']} "
+                    f"(some rows listed several addresses in one email field)"
+                )
+            st.markdown(f"- **No usable email:** {ex_stats['no_email_count']}")
+            if use_validation:
+                st.markdown(f"- **Invalid format:** {ex_stats['invalid_count']} (failed `email_validator`, same as Saved Leads)")
+            st.markdown(f"- **Duplicate email:** {ex_stats['dup_count']}")
+
+    if not export_leads:
+        st.warning(
+            "No leads to preview or export — selected sessions may be empty, or **Unique valid** removed all rows. "
+            "Try **Full** or **Unique (dedup only)**."
+        )
+        return
+
+    preset = st.selectbox(
+        "Filter columns to show/export",
+        list(COLUMN_PRESETS.keys()),
+        key="live_sess_preset",
+    )
+    export_cols = COLUMN_PRESETS[preset]
+
+    dfm = pd.DataFrame(export_leads)
+    show_cols = [c for c in export_cols if c in dfm.columns]
+    if not show_cols:
+        show_cols = [c for c in dfm.columns if c != "_session_id"]
+    st.dataframe(dfm[show_cols], use_container_width=True, hide_index=True)
+
+    st.markdown("**Download / save (manual only):**")
+    e1, e2, e3 = st.columns(3)
+    csv_bytes = leads_to_dataframe(export_leads, columns=export_cols).to_csv(index=False).encode()
+    with e1:
+        st.download_button(
+            "⬇️ Download CSV",
+            data=csv_bytes,
+            file_name="merged_sessions.csv",
+            mime="text/csv",
+            key="live_sess_dl_csv",
+        )
+    with e2:
+        if st.button("📄 Save CSV to exports folder", key="live_sess_save_csv"):
+            path = export_to_csv(
+                export_leads,
+                f"merged_live_{len(export_leads)}_leads.csv",
+                columns=export_cols,
+            )
+            st.success(f"Saved: {path}")
+    with e3:
+        if st.button("📊 Save Excel to exports folder", key="live_sess_save_xlsx"):
+            path = export_to_excel(
+                export_leads,
+                f"merged_live_{len(export_leads)}_leads.xlsx",
+                columns=export_cols,
+            )
+            st.success(f"Saved: {path}")
+
+
 # ─── License Check ───────────────────────────────────────────────────────────
 # License checking is now handled by activation_ui module
+
+# Internal API values for automation (unchanged); UI labels stay vendor-neutral
+_SEARCH_ENGINE_OPTIONS = ["duckduckgo", "google"]
+
+
+def _search_provider_label(internal: str) -> str:
+    if internal == "duckduckgo":
+        return "Standard (recommended)"
+    return "Alternative (may prompt for verification)"
+
+
+def _search_provider_help() -> str:
+    return (
+        "Standard runs with fewer interruptions. "
+        "Alternative may request human verification after repeated use."
+    )
 
 
 # ─── Sidebar ───────────────────────────────────────────────────────────────────
@@ -374,21 +681,20 @@ def render_sidebar():
         
         st.divider()
 
-        st.markdown("### ⚙️ Engine")
-        # Search Engine - always visible in sidebar (avoids CAPTCHA)
+        st.markdown("### Engine")
         if "search_engine" not in st.session_state:
             st.session_state.search_engine = "duckduckgo"
         search_engine = st.selectbox(
-            "Search Engine",
-            ["duckduckgo", "google"],
-            format_func=lambda x: "🦆 DuckDuckGo (no CAPTCHA)" if x == "duckduckgo" else "🔍 Google",
+            "Search provider",
+            _SEARCH_ENGINE_OPTIONS,
+            format_func=_search_provider_label,
             index=0 if st.session_state.search_engine == "duckduckgo" else 1,
             key="sidebar_search_engine",
-            help="DuckDuckGo recommended - no CAPTCHA. Google may block on repeat runs.",
+            help=_search_provider_help(),
         )
         st.session_state.search_engine = search_engine
         if search_engine == "google":
-            st.caption("⚠️ Google may show CAPTCHA")
+            st.caption("Alternative provider may request verification after heavy use.")
         # Check server status
         if not st.session_state.server_checked:
             try:
@@ -415,117 +721,228 @@ def render_sidebar():
             st.metric("Leads", stats["total_leads"])
             st.metric("Emails", stats["unique_emails"])
             st.caption("All sessions")
+            _ret = int(os.environ.get("LEADS_RETENTION_DAYS", "30"))
+            if _ret > 0:
+                st.caption(f"🗑️ Auto-delete sessions older than {_ret} days (LEADS_RETENTION_DAYS)")
         except Exception:
             st.caption("No data yet")
 
 
-# ─── Bottom Navigation ────────────────────────────────────────────────────────
+# ─── Top Navigation (single widget key = source of truth; avoids mixed tabs) ─
+NAV_OPTIONS = ["🔍 Live Extractor", "📋 Saved Leads", "📧 Email Sender", "⚙️ Settings"]
+
+
 def render_bottom_navigation():
-    """Render top navigation tabs"""
-    # Keep the navigation at top for ease-of-use.
+    """Top nav: Streamlit 1.40+ uses st.rerun (not experimental_rerun). Radio key drives current_page."""
     st.markdown('<div class="top-nav"></div>', unsafe_allow_html=True)
 
-    nav_value = st.radio(
-        label="",
-        options=["🔍 Live Extractor", "📋 Saved Leads", "📧 Email Sender", "⚙️ Settings"],
-        index={"🔍 Live Extractor": 0, "📋 Saved Leads": 1, "📧 Email Sender": 2, "⚙️ Settings": 3}.get(st.session_state.current_page, 0),
-        format_func=lambda label: label,
-        horizontal=True,
-        key="top_nav_radio"
-    )
+    if "top_nav_radio" not in st.session_state:
+        init = st.session_state.get("current_page")
+        st.session_state.top_nav_radio = init if init in NAV_OPTIONS else NAV_OPTIONS[0]
+    if st.session_state.top_nav_radio not in NAV_OPTIONS:
+        st.session_state.top_nav_radio = NAV_OPTIONS[0]
 
-    if nav_value != st.session_state.current_page:
-        st.session_state.current_page = nav_value
-        st.experimental_rerun()
+    st.radio(
+        label="Navigation",
+        options=NAV_OPTIONS,
+        horizontal=True,
+        key="top_nav_radio",
+        label_visibility="collapsed",
+    )
+    st.session_state.current_page = st.session_state.top_nav_radio
 
 
 # ─── Main Extractor Page ─────────────────────────────────────────────────────
 def render_extractor_page():
-    # Drain WebSocket queue FIRST (thread-safe: WS callbacks put here, we apply on main thread)
+    # Drain queue without full-page rerun while running (live UI uses st.fragment)
     q = st.session_state.get("ws_message_queue")
-    if drain_ws_queue(q):
-        st.rerun()
+    drain_ws_queue(q)
 
-    st.markdown('<p class="app-title">🎯 Live Browser Automation</p>', unsafe_allow_html=True)
-    engine = st.session_state.get("search_engine", "duckduckgo")
-    subtitle = "Watch the browser automate DuckDuckGo searches in real-time (no CAPTCHA)" if engine == "duckduckgo" else "Watch the browser automate Google searches (may show CAPTCHA)"
-    st.markdown(f'<p class="app-subtitle">{subtitle}</p>', unsafe_allow_html=True)
-
-    # ── Query Input ─────────────────────────────────────────────────────────
-    st.markdown("### 🔍 Search Queries")
-    query_input = st.text_area(
-        "Enter search query (single query). For multiple, use batch mode below:",
-        height=70,
-        placeholder="Example: 'digital twin engineers' 'service' filetype:pdf intext:@ intext:Livermore, California",
-        key="query_input",
+    st.markdown('<p class="app-title">Live extraction</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="app-subtitle">Search results and PDF processing run in the browser. Open Settings below when you need to tune behavior.</p>',
+        unsafe_allow_html=True,
     )
 
-    # ── Batch Mode ─────────────────────────────────────────────────────────
-    with st.expander("➕ Batch Mode (Multiple Queries)", expanded=False):
-        batch_queries_text = st.text_area(
-            "Enter up to 10 queries (one per line):",
-            height=150,
-            placeholder="Query 1\nQuery 2\n...\nQuery 10",
-            key="batch_queries",
-            help="Batch mode runs each query as a separate session. Use Reload between batches for a fresh browser each time.",
-        )
-        # Batch mode is implicit: if there are one or more batch queries, they will be used.
-        batch_mode = bool(batch_queries_text and any(q.strip() for q in batch_queries_text.split("\n")))
-        batch_reload = st.checkbox(
-            "🔄 Reload browser between each batch (recommended)",
-            value=True,
-            key="batch_reload",
-            help="After each query: save, close browser, start fresh — prevents 'trying twice' issues and improves reliability for 3+ queries.",
-        )
-
-    # ── Search Engine (prominent - above Settings) ─────────────────────────
-    st.markdown("**🦆 Search Engine**")
-    eng_col1, eng_col2 = st.columns([1, 3])
-    with eng_col1:
-        search_engine = st.selectbox(
-            "Engine",
-            ["duckduckgo", "google"],
-            format_func=lambda x: "🦆 DuckDuckGo (no CAPTCHA)" if x == "duckduckgo" else "🔍 Google",
-            index=0 if st.session_state.get("search_engine", "duckduckgo") == "duckduckgo" else 1,
-            key="main_search_engine",
-            help="DuckDuckGo avoids CAPTCHA. Use Google only if needed.",
-        )
-        st.session_state.search_engine = search_engine
-    with eng_col2:
-        if search_engine == "google":
-            st.warning("⚠️ Google may show CAPTCHA on repeat runs. Switch to DuckDuckGo to avoid.")
-        else:
-            st.success("✅ DuckDuckGo selected — no CAPTCHA blocks")
-    st.caption("Choose DuckDuckGo to avoid getting blocked by Google's CAPTCHA.")
-    st.divider()
-
-    # ── Settings ───────────────────────────────────────────────────────────
-    with st.expander("⚙️ Settings", expanded=True):
+    # ── Settings (collapsed by default) ─────────────────────────────────────
+    with st.expander("Settings", expanded=False):
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("**Automation Settings**")
-            max_pages = st.number_input("Max Pages per Query", min_value=1, max_value=20, value=10, step=1)
-            delay_pages = st.number_input("Delay Between Pages (s)", min_value=0.0, max_value=10.0, value=3.0, step=0.5)
-            delay_actions = st.number_input("Action Delay (s)", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
+            st.markdown("**Automation**")
+            max_pages = st.number_input(
+                "Max pages per query",
+                min_value=1,
+                max_value=500,
+                value=int(st.session_state.settings.get("max_pages", 10)),
+                step=1,
+                help="Higher values scan more result pages per query variant. Use larger numbers for very high volume targets.",
+            )
+            st.session_state.settings["max_pages"] = max_pages
+            delay_pages = st.number_input(
+                "Delay between pages (seconds)",
+                min_value=0.0,
+                max_value=10.0,
+                value=3.0,
+                step=0.5,
+            )
+            delay_actions = st.number_input(
+                "Action delay (seconds)",
+                min_value=0.0,
+                max_value=5.0,
+                value=1.0,
+                step=0.1,
+            )
 
         with col2:
-            st.markdown("**Server Settings**")
-            st.caption("Search Engine: set in sidebar → ⚙️ Engine")
+            st.markdown("**Connection**")
+            st.caption("**Search provider** is set in the left sidebar under **Engine**.")
             headless_live = st.checkbox(
-                "🖥️ Run headless (no browser window)",
+                "Run headless (no browser window)",
                 value=bool(st.session_state.settings.get("headless", False)),
                 key="live_headless",
-                help="Headless = no visible browser. Activity still shows in logs; PDFs and emails are extracted normally. Use when the automation window doesn't pop up."
+                help="No visible browser window. Activity still appears in the log; extraction continues normally.",
             )
             st.session_state.settings["headless"] = headless_live
             if headless_live:
-                st.caption("✅ Headless: logs + extracted leads will update live")
-            server_url = st.text_input("Server URL", value=WEBSOCKET_URL, help="WebSocket server URL")
-            auto_save = st.checkbox("Auto-Save to Database", value=True)
-            target_leads = st.number_input("Target Lead Count (0 = no limit)", min_value=0, max_value=500000, value=0, step=100, help="0 = run until no more pages. Set a number to stop when that many leads are extracted.")
+                st.caption("Headless mode: log and lead counts still update live.")
+            server_url = st.text_input("Server URL", value=WEBSOCKET_URL, help="WebSocket endpoint for the automation service")
+            auto_save = st.checkbox("Save results to database", value=True)
+            target_leads = st.number_input(
+                "Target lead count (0 = no limit)",
+                min_value=0,
+                max_value=500000,
+                value=int(st.session_state.get("target_lead_count", 0)),
+                step=500,
+                help="Optional cap. Additional query phrases may be used automatically when results are below the soft threshold. 0 leaves volume uncapped.",
+            )
             st.session_state.target_lead_count = target_leads
-            st.session_state.search_engine = search_engine
+
+    st.divider()
+
+    # ── Query input (Start immediately follows) ───────────────────────────
+    st.markdown("### Search query")
+    st.caption(
+        "Only **PDF** links from results are processed. `filetype:pdf` is applied automatically when you omit it. "
+        "Describe **who or what** and **where** (or sector); extra phrases are added automatically when results are thin."
+    )
+    query_input = st.text_area(
+        "Query",
+        height=70,
+        label_visibility="collapsed",
+        placeholder=(
+            "Example: nonprofit chamber of commerce members Denver Colorado\n"
+            "Organization type, audience or role, and location — adjust as needed."
+        ),
+        key="query_input",
+    )
+
+    with st.expander("Batch mode (multiple queries)", expanded=False):
+        st.text_area(
+            "Up to 10 queries (one per line)",
+            height=150,
+            placeholder=(
+                "rotary club officers Seattle Washington\n"
+                "HOA board of directors contact Austin Texas\n"
+                "small business association membership roster Chicago Illinois"
+            ),
+            key="batch_queries",
+            help="When this box has text, it replaces the single query above. Reload between queries is recommended for reliability.",
+        )
+        st.checkbox(
+            "Reload browser between each query",
+            value=True,
+            key="batch_reload",
+            help="Closes and restarts the browser after each line — reduces stuck sessions on long batches.",
+        )
+
+    _batch_raw = (st.session_state.get("batch_queries") or "").strip()
+    batch_mode = bool(_batch_raw) and any(line.strip() for line in _batch_raw.split("\n"))
+
+    # ── Controls (immediately after query / batch) ──────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        start_btn = st.button("Start", type="primary", use_container_width=True, disabled=st.session_state.is_running)
+    with c2:
+        stop_btn = st.button("Stop", use_container_width=True, disabled=not st.session_state.is_running)
+    with c3:
+        clear_btn = st.button("Clear", use_container_width=True)
+    with c4:
+        check_srv_clicked = st.button("Check server", use_container_width=True)
+
+    if clear_btn:
+        st.session_state.activity_log = []
+        st.session_state.extracted_leads = []
+        st.session_state.current_screenshot = None
+        st.rerun()
+
+    if stop_btn:
+        st.session_state.is_running = False
+        ws = _ws_client_ref[0] if _ws_client_ref else None
+        if ws:
+            try:
+                if hasattr(ws, "send"):
+                    ws.send(json.dumps({"command": "stop"}))
+                    st.session_state.activity_log.append("Stop sent to automation service.")
+                else:
+                    st.session_state.activity_log.append("Stop requested (connection closing).")
+            except Exception as e:
+                st.session_state.activity_log.append(f"Stop requested ({str(e)[:50]}).")
+        else:
+            st.session_state.activity_log.append("Stopped (no active connection).")
+        st.rerun()
+
+    if start_btn:
+        btxt = st.session_state.get("batch_queries") or ""
+        queries: List[str] = []
+        if batch_mode and btxt.strip():
+            queries = [q.strip() for q in btxt.split("\n") if q.strip()][:10]
+            if len([q for q in btxt.split("\n") if q.strip()]) > 10:
+                st.warning("Only the first 10 queries will run.")
+        else:
+            qi = (st.session_state.get("query_input") or "").strip()
+            if qi:
+                queries = [qi]
+
+        if not queries:
+            st.warning("Enter a search query, or add lines under Batch mode.")
+        else:
+            st.session_state.is_running = True
+            st.session_state.extracted_leads = []
+            st.session_state.activity_log = []
+            st.session_state.current_screenshot = None
+            st.session_state.saved_files = []
+
+            msg_queue = Queue()
+            st.session_state.ws_message_queue = msg_queue
+            target_leads = st.session_state.get("target_lead_count", 0)
+            search_engine = st.session_state.get("search_engine", "duckduckgo")
+            headless = bool(st.session_state.settings.get("headless", False))
+            batch_reload = bool(batch_mode and st.session_state.get("batch_reload", True))
+            thread = threading.Thread(
+                target=run_websocket_client,
+                args=(queries, max_pages, delay_pages, delay_actions, msg_queue, target_leads, search_engine, headless, batch_reload),
+                daemon=True,
+            )
+            thread.start()
+            st.session_state.live_queries_for_sessions = list(queries)
+            st.rerun()
+
+    if check_srv_clicked:
+        try:
+            import httpx
+            with st.spinner("Checking server…"):
+                resp = httpx.get(f"{AUTOMATION_SERVER_URL.rstrip('/')}/", timeout=2)
+            if resp.status_code == 200:
+                st.session_state.websocket_connected = True
+                st.session_state.server_checked = True
+                st.success("Server is running.")
+            else:
+                st.error("Server returned an error.")
+        except Exception as e:
+            st.session_state.websocket_connected = False
+            st.error(f"Server not reachable: {str(e)[:50]}")
+            st.caption("Ensure the automation service is running.")
 
     # ── Status Bar with Real-time Lead Count ─────────────────────────────
     status_text = "Ready" if not st.session_state.is_running else "🔄 Running..."
@@ -566,20 +983,19 @@ def render_extractor_page():
     import platform
     if platform.system() == "Darwin":
         st.info(
-            "💡 **Browser not showing?** Enable **🖥️ Run headless** above — you'll still see activity in the logs and get extracted emails. "
-            "Or double-click `START_LEAD_EXTRACTOR.command` for a visible Chrome window."
+            "**Browser window not visible?** Open **Settings** and enable **Run headless**, or launch from Terminal with "
+            "`START_LEAD_EXTRACTOR.command` for a visible browser window."
         )
     elif platform.system() == "Windows":
         st.info(
-            "💡 **Browser not showing?** Enable **🖥️ Run headless** above, or use **🖥️ Launch in CMD** to run from Command Prompt for a visible browser."
+            "**Browser window not visible?** Open **Settings** and enable **Run headless**, or use **Launch in CMD** below."
         )
 
     # ── Launch in Terminal/CMD (for visible browser) ───────────────────────
     import subprocess
-    from pathlib import Path
     proj = Path(__file__).resolve().parent.parent
     if platform.system() == "Darwin":
-        if st.button("🖥️ Launch in Terminal (browser will pop up)", key="launch_terminal", help="Opens macOS Terminal — use if browser window doesn't appear"):
+        if st.button("Launch in Terminal (visible browser)", key="launch_terminal", help="Opens macOS Terminal if the in-app browser does not appear"):
             try:
                 cmd = f"cd {proj} && python3 launch_app_simple.py"
                 script = f'tell application "Terminal" to do script "{cmd}"'
@@ -588,7 +1004,7 @@ def render_extractor_page():
             except Exception as e:
                 st.error(f"Could not open Terminal: {e}")
     elif platform.system() == "Windows":
-        if st.button("🖥️ Launch in CMD (browser will pop up)", key="launch_cmd", help="Opens Command Prompt — use if browser window doesn't appear"):
+        if st.button("Launch in CMD (visible browser)", key="launch_cmd", help="Opens Command Prompt if the in-app browser does not appear"):
             try:
                 proj_str = str(proj).replace("'", "''")  # Escape for cmd
                 subprocess.Popen(
@@ -600,129 +1016,17 @@ def render_extractor_page():
             except Exception as e:
                 st.error(f"Could not open Command Prompt: {e}")
 
-    # ── Pre-start engine indicator ───────────────────────────────────────
-    active_engine = st.session_state.get("search_engine", "duckduckgo")
-    if active_engine == "duckduckgo":
-        st.info("🦆 **When you click Start:** Extraction will use **DuckDuckGo** — no CAPTCHA.")
-    else:
-        st.warning("⚠️ **When you click Start:** Extraction will use **Google** — you may see CAPTCHA. Switch to DuckDuckGo above to avoid.")
-
-    # ── Controls ──────────────────────────────────────────────────────────
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        start_btn = st.button("▶️ Start", type="primary", use_container_width=True, disabled=st.session_state.is_running)
-    with col2:
-        stop_btn = st.button("⏹️ Stop", use_container_width=True, disabled=not st.session_state.is_running)
-    with col3:
-        clear_btn = st.button("🗑️ Clear", use_container_width=True)
-    with col4:
-        if st.button("🔄 Check Server", use_container_width=True):
-            # Test server connection
-            try:
-                import httpx
-                resp = httpx.get(f"{AUTOMATION_SERVER_URL.rstrip('/')}/", timeout=2)
-                if resp.status_code == 200:
-                    st.session_state.websocket_connected = True
-                    st.session_state.server_checked = True
-                    st.success("✅ Server is running")
-                else:
-                    st.error("❌ Server returned error")
-            except Exception as e:
-                st.session_state.websocket_connected = False
-                st.error(f"❌ Server not running: {str(e)[:50]}")
-                st.caption("Make sure automation server is running")
-
-    if clear_btn:
-        st.session_state.activity_log = []
-        st.session_state.extracted_leads = []
-        st.session_state.current_screenshot = None
-        st.rerun()
-
-    # ── Stop Button Handler ───────────────────────────────────────────────────
-    if stop_btn:
-        st.session_state.is_running = False
-        ws = _ws_client_ref[0] if _ws_client_ref else None
-        if ws:
-            try:
-                if hasattr(ws, "send"):
-                    ws.send(json.dumps({"command": "stop"}))
-                    st.session_state.activity_log.append("🛑 Stop command sent to server...")
-                else:
-                    st.session_state.activity_log.append("🛑 Stop requested (connection closing...)")
-            except Exception as e:
-                st.session_state.activity_log.append(f"🛑 Stop requested (error: {str(e)[:50]})")
-        else:
-            st.session_state.activity_log.append("🛑 Stopped (no active connection)")
-        st.rerun()
-
-    # ── Live Browser View & Activity Log ───────────────────────────────────
-    col_browser, col_log = st.columns([1.2, 0.8])
-
-    with col_browser:
-        st.markdown("### 🖥️ Live Browser View")
-        browser_view = st.empty()
-        if st.session_state.current_screenshot:
-            browser_view.image(
-                f"data:image/png;base64,{st.session_state.current_screenshot}",
-                use_container_width=True,
-                caption="Live browser automation",
-            )
-        else:
-            browser_view.info("👆 Click 'Start' to see live browser automation...")
-
-    with col_log:
-        st.markdown("### 📋 Activity Log")
-        log_text = "\n".join(st.session_state.activity_log[-50:])
-        st.markdown(f'<div class="activity-log">{log_text}</div>', unsafe_allow_html=True)
-
-    # ── Start Automation ───────────────────────────────────────────────────
-    if start_btn:
-        queries = []
-        if batch_mode and batch_queries_text:
-            queries = [q.strip() for q in batch_queries_text.split("\n") if q.strip()][:10]
-            if len([q for q in batch_queries_text.split("\n") if q.strip()]) > 10:
-                st.warning("Only first 10 queries will run. Rest ignored.")
-        elif query_input:
-            queries = [query_input.strip()]
-
-        if not queries:
-            st.warning("Please enter at least one search query.")
-        else:
-            st.session_state.is_running = True
-            st.session_state.extracted_leads = []
-            st.session_state.activity_log = []
-            st.session_state.current_screenshot = None
-            st.session_state.saved_files = []
-
-            # Create queue for thread-safe updates (WS thread must NOT touch session_state)
-            msg_queue = Queue()
-            st.session_state.ws_message_queue = msg_queue
-            target_leads = st.session_state.get("target_lead_count", 0)
-            search_engine = st.session_state.get("search_engine", "duckduckgo")
-            headless = bool(st.session_state.settings.get("headless", False))
-            batch_reload = bool(batch_mode and st.session_state.get("batch_reload", True))
-            thread = threading.Thread(
-                target=run_websocket_client,
-                args=(queries, max_pages, delay_pages, delay_actions, msg_queue, target_leads, search_engine, headless, batch_reload),
-                daemon=True,
-            )
-            thread.start()
-
-    # ── Auto-refresh when running (throttled) ──────────────────────────────
+    # ── Live Browser View & Activity Log (fragment = no whole-screen blink) ─
     if st.session_state.is_running:
-        # Throttle reruns to max 2 per second
-        current_time = time.time()
-        if not hasattr(st.session_state, 'last_rerun_time'):
-            st.session_state.last_rerun_time = 0
-        
-        if (current_time - st.session_state.last_rerun_time) >= 0.25:  # ~4 reruns/sec for live activity log + screenshot updates
-            placeholder = st.empty()
-            placeholder.markdown("🔄 Live updates...")
-            time.sleep(0.2)  # Small delay for WebSocket updates
-            if st.session_state.needs_refresh:
-                st.session_state.needs_refresh = False
-            st.session_state.last_rerun_time = current_time
-            st.rerun()
+        _live_automation_fragment()
+    else:
+        _render_live_panel_content(extracting=False)
+
+    if st.session_state.pop("_terminal_rerun", False):
+        st.rerun()
+
+    # ── Saved sessions for same query (merge / validate / download here) ───
+    _render_live_query_sessions_panel()
 
     # ── Saved Files Display ─────────────────────────────────────────────────
     if st.session_state.saved_files:
@@ -805,7 +1109,10 @@ def render_saved_leads_page():
         st.session_state.saved_leads_column_preset = "Emails + Names + Phones"
     
     st.markdown("### 🔗 Merge & Export Multiple Sessions")
-    st.caption("Select sessions to merge, filter columns, and download or send to Email Sender.")
+    st.caption(
+        "Select sessions to merge, filter columns, and download or send to Email Sender. "
+        "**Live runs** (new builds): one **Start** = one saved session — auto query-variations no longer create extra rows."
+    )
     
     # Session multi-select
     sessions_by_date = {}
@@ -873,49 +1180,33 @@ def render_saved_leads_page():
         use_full = "Full" in export_mode
         use_validation = "valid" in export_mode.lower()
 
-        if use_full:
-            export_leads = all_merged
-            msg = f"📋 {len(export_leads)} leads (full, no dedup)"
-            st.info(msg)
-        else:
-            # Dedupe by email (keep first); optionally validate format
-            seen = set()
-            unique = []
-            no_email_count = 0
-            invalid_count = 0
-            dup_count = 0
-            for l in all_merged:
-                e = (l.get("email") or "").strip()
-                if not e or "@" not in e:
-                    no_email_count += 1
-                    continue
-                norm = e.lower()
-                if use_validation:
-                    try:
-                        validated = validate_email(norm, check_deliverability=False)
-                        norm = validated.email
-                    except EmailNotValidError:
-                        invalid_count += 1
-                        continue
-                if norm not in seen:
-                    seen.add(norm)
-                    l_copy = dict(l)
-                    l_copy["email"] = norm
-                    unique.append(l_copy)
-                else:
-                    dup_count += 1
-            export_leads = unique
+        export_leads, ex_stats = filter_merged_leads_for_export(
+            all_merged, use_full=use_full, use_validation=use_validation
+        )
 
+        if use_full:
+            st.info(f"📋 {len(export_leads)} leads (full, no dedup)")
+        else:
             if use_validation:
-                msg = f"✅ {len(export_leads)} unique valid leads (from {len(all_merged)} total)"
+                st.success(
+                    f"✅ {len(export_leads)} unique valid leads "
+                    f"(from {ex_stats['merged_raw']} rows → {ex_stats['rows_after_split']} after splitting multi-email cells)"
+                )
             else:
-                msg = f"✅ {len(export_leads)} unique leads (from {len(all_merged)} total, dedup only)"
-            st.success(msg)
+                st.success(
+                    f"✅ {len(export_leads)} unique leads "
+                    f"(from {ex_stats['merged_raw']} rows → {ex_stats['rows_after_split']} after split, dedup only)"
+                )
             with st.expander("📊 Breakdown (why leads were excluded)"):
-                st.markdown(f"- **No email:** {no_email_count} (leads with empty/missing email)")
+                if ex_stats["rows_after_split"] != ex_stats["merged_raw"]:
+                    st.markdown(
+                        f"- **Rows after splitting cells:** {ex_stats['rows_after_split']} "
+                        f"(some rows had several addresses in the email field)"
+                    )
+                st.markdown(f"- **No email:** {ex_stats['no_email_count']} (empty/missing after split)")
                 if use_validation:
-                    st.markdown(f"- **Invalid format:** {invalid_count} (failed email validation)")
-                st.markdown(f"- **Duplicate:** {dup_count} (same email already seen)")
+                    st.markdown(f"- **Invalid format:** {ex_stats['invalid_count']} (failed email validation)")
+                st.markdown(f"- **Duplicate:** {ex_stats['dup_count']} (same email already seen)")
                 st.caption("Try **Full** to export everything, or **Unique (dedup only)** if validation drops too many.")
 
         # Column filter
@@ -955,6 +1246,7 @@ def render_saved_leads_page():
                 st.session_state.merged_leads_for_email = export_leads
                 st.session_state.selected_session_ids = list(st.session_state.saved_leads_selected_ids)
                 st.session_state.current_page = "📧 Email Sender"
+                st.session_state.top_nav_radio = "📧 Email Sender"
                 st.rerun()
     
     st.divider()
@@ -1008,21 +1300,20 @@ def render_settings_page():
     st.markdown('<p class="app-title">⚙️ Settings</p>', unsafe_allow_html=True)
     st.markdown('<p class="app-subtitle">Configure application settings</p>', unsafe_allow_html=True)
 
-    # ── Search Engine (prominent - most requested) ─────────────────────────
-    st.markdown("### 🦆 Search Engine")
+    st.markdown("### Search provider")
     search_engine = st.selectbox(
-        "Choose which search engine to use for lead extraction:",
-        ["duckduckgo", "google"],
-        format_func=lambda x: "🦆 DuckDuckGo (recommended – no CAPTCHA)" if x == "duckduckgo" else "🔍 Google (may show CAPTCHA)",
+        "Default provider for extraction",
+        _SEARCH_ENGINE_OPTIONS,
+        format_func=_search_provider_label,
         index=0 if st.session_state.get("search_engine", "duckduckgo") == "duckduckgo" else 1,
         key="settings_search_engine",
-        help="DuckDuckGo is recommended to avoid Google CAPTCHA blocks.",
+        help=_search_provider_help(),
     )
     st.session_state.search_engine = search_engine
     if search_engine == "google":
-        st.warning("⚠️ Google may show CAPTCHA on repeat runs. Switch to DuckDuckGo to avoid.")
+        st.info("Alternative provider may show verification prompts on repeated runs.")
     else:
-        st.success("✅ DuckDuckGo selected — no CAPTCHA blocks")
+        st.success("Standard provider selected.")
 
     st.divider()
 
@@ -1031,7 +1322,7 @@ def render_settings_page():
     settings = st.session_state.settings
     col1, col2 = st.columns(2)
     with col1:
-        max_pages = st.number_input("Max Pages per Query", min_value=1, max_value=20, value=int(settings.get("max_pages", 10)), step=1, key="set_max_pages")
+        max_pages = st.number_input("Max Pages per Query", min_value=1, max_value=500, value=int(settings.get("max_pages", 10)), step=1, key="set_max_pages")
         delay_pages = st.number_input("Delay Between Pages (s)", min_value=0.0, max_value=10.0, value=float(settings.get("delay_pages", 2.0)), step=0.5, key="set_delay_pages")
     with col2:
         delay_actions = st.number_input("Action Delay (s)", min_value=0.0, max_value=5.0, value=float(settings.get("delay_actions", 1.0)), step=0.1, key="set_delay_actions")

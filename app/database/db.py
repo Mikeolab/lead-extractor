@@ -4,7 +4,8 @@ Database Module — SQLite (local) or PostgreSQL/Neon (when DATABASE_URL is set)
 from __future__ import annotations
 import os
 import sqlite3
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dataclasses import dataclass, field
 from app.config import DATABASE_PATH
@@ -57,6 +58,7 @@ def get_connection():
 
         CREATE INDEX IF NOT EXISTS idx_leads_search_id ON leads(search_id);
         CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email);
+        CREATE INDEX IF NOT EXISTS idx_searches_created_at ON searches(created_at);
 
         -- Email module tables
         CREATE TABLE IF NOT EXISTS mailboxes (
@@ -76,7 +78,8 @@ def get_connection():
             last_used TIMESTAMP,
             last_error TEXT,
             error_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            smtp_encryption TEXT DEFAULT 'auto'
         );
 
         CREATE TABLE IF NOT EXISTS email_campaigns (
@@ -119,8 +122,23 @@ def get_connection():
         CREATE INDEX IF NOT EXISTS idx_queue_campaign ON email_queue(campaign_id, status);
     """)
 
+    _migrate_sqlite_mailboxes_smtp_encryption(conn)
     conn.commit()
     return conn
+
+
+def _migrate_sqlite_mailboxes_smtp_encryption(conn: sqlite3.Connection) -> None:
+    """Add smtp_encryption to mailboxes if missing (older DBs)."""
+    try:
+        cur = conn.execute("PRAGMA table_info(mailboxes)")
+        cols = {row[1] for row in cur.fetchall()}
+    except sqlite3.Error:
+        return
+    if not cols or "smtp_encryption" in cols:
+        return
+    conn.execute(
+        "ALTER TABLE mailboxes ADD COLUMN smtp_encryption TEXT DEFAULT 'auto'"
+    )
 
 
 def save_search(query: str, num_results: int = 0) -> int:
@@ -203,6 +221,46 @@ def get_recent_searches(limit: int = 20) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_searches_for_query(query_text: str, limit: int = 40) -> list[dict]:
+    """
+    All saved sessions whose query matches (case-insensitive, trimmed).
+    Used on Live page to merge/validate/download runs for the same query without opening Saved Leads.
+    """
+    if not query_text or not str(query_text).strip():
+        return []
+    if _use_postgres and _db:
+        return _db.get_searches_for_query(query_text, limit)
+    key = query_text.strip().lower()
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT * FROM searches
+           WHERE LOWER(TRIM(query)) = ?
+           ORDER BY created_at DESC LIMIT ?""",
+        (key, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def get_searches_for_queries(queries: list[str], limit: int = 50) -> list[dict]:
+    """Union of sessions matching any query string (normalized), newest first."""
+    if not queries:
+        return []
+    seen: set[int] = set()
+    out: list[dict] = []
+    for qt in queries:
+        q = (qt or "").strip()
+        if not q:
+            continue
+        for s in get_searches_for_query(q, limit=limit):
+            sid = s.get("id")
+            if sid is not None and sid not in seen:
+                seen.add(sid)
+                out.append(s)
+    out.sort(key=lambda x: str(x.get("created_at") or ""), reverse=True)
+    return out[:limit]
+
+
 def get_leads_by_search(search_id: int) -> list[dict]:
     """Get all leads for a specific search."""
     if _use_postgres and _db:
@@ -242,6 +300,71 @@ def delete_search(search_id: int) -> None:
     conn.execute("DELETE FROM searches WHERE id = ?", (search_id,))
     conn.commit()
     conn.close()
+
+
+def prune_old_searches_and_leads(retention_days: int | None = None) -> dict:
+    """
+    Delete search sessions and their leads older than retention_days (by searches.created_at).
+    Set env LEADS_RETENTION_DAYS=0 to disable pruning from callers that check this.
+    """
+    if retention_days is None:
+        retention_days = int(os.environ.get("LEADS_RETENTION_DAYS", "30"))
+    if retention_days <= 0:
+        return {"skipped": True, "reason": "LEADS_RETENTION_DAYS <= 0"}
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+
+    if _use_postgres and _db:
+        return _db.prune_old_searches_and_leads_cutoff(cutoff)
+
+    conn = get_connection()
+    n_leads = conn.execute(
+        "SELECT COUNT(*) FROM leads WHERE search_id IN (SELECT id FROM searches WHERE created_at < ?)",
+        (cutoff_str,),
+    ).fetchone()[0]
+    n_search = conn.execute(
+        "SELECT COUNT(*) FROM searches WHERE created_at < ?",
+        (cutoff_str,),
+    ).fetchone()[0]
+    conn.execute(
+        "DELETE FROM leads WHERE search_id IN (SELECT id FROM searches WHERE created_at < ?)",
+        (cutoff_str,),
+    )
+    conn.execute("DELETE FROM searches WHERE created_at < ?", (cutoff_str,))
+    conn.commit()
+    conn.close()
+    return {
+        "searches_deleted": n_search,
+        "leads_deleted": n_leads,
+        "retention_days": retention_days,
+        "cutoff_utc": cutoff_str,
+    }
+
+
+def maybe_prune_stale_searches(interval_hours: float = 24.0) -> dict | None:
+    """
+    Run prune_old_searches_and_leads at most once per interval_hours (persisted next to DB file).
+    Safe to call on every Streamlit rerun / server startup.
+    """
+    retention_days = int(os.environ.get("LEADS_RETENTION_DAYS", "30"))
+    if retention_days <= 0:
+        return None
+    marker = DATABASE_PATH.parent / ".leads_retention_last_prune"
+    try:
+        if marker.exists():
+            last = float(marker.read_text().strip())
+            if time.time() - last < interval_hours * 3600:
+                return None
+    except (ValueError, OSError):
+        pass
+    result = prune_old_searches_and_leads(retention_days=retention_days)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(str(time.time()))
+    except OSError:
+        pass
+    return result
 
 
 def get_lead_stats() -> dict:
