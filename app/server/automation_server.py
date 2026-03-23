@@ -69,6 +69,12 @@ from app.extractors.email_extractor import extract_emails
 from app.extractors.name_extractor import extract_contact_names, extract_names_from_email
 from app.extractors.phone_extractor import extract_phones
 from app.database.db import save_search, save_leads
+from app.filters.email_domain_rules import (
+    apply_site_restriction_to_query,
+    build_site_restriction_clause,
+    filter_leads_by_email_domains,
+    parse_email_domain_allowlist,
+)
 
 app = FastAPI()
 
@@ -390,6 +396,8 @@ class AutomationManager:
         search_engine: str = "duckduckgo",  # "duckduckgo" avoids Google CAPTCHA
         headless: bool = False,  # False = visible browser (from Settings)
         reload_between_queries: bool = False,  # Fresh browser between each batch query
+        email_domain_allowlist: str = "",  # Keep only leads whose email matches (see filters/email_domain_rules)
+        search_site_domains: str = "",  # Append site: restrictions to each search query
     ):
         """Run browser automation loop through multiple queries."""
         self.is_running = True
@@ -560,6 +568,23 @@ class AutomationManager:
             session_start_time = datetime.now()
             self.all_leads_buffer = []  # Reset buffer
 
+            email_rules = parse_email_domain_allowlist(email_domain_allowlist)
+            site_clause = build_site_restriction_clause(search_site_domains)
+            if site_clause:
+                await self.broadcast({
+                    "type": "status",
+                    "message": f"🔒 **Site restriction** added to every search: `{site_clause[:140]}{'…' if len(site_clause) > 140 else ''}`",
+                })
+            if not email_rules.is_empty():
+                await self.broadcast({
+                    "type": "status",
+                    "message": (
+                        f"🎯 **Email domain filter** on — keeping only addresses matching "
+                        f"{len(email_rules.exact_domains)} domain(s) and {len(email_rules.suffixes)} suffix rule(s); "
+                        f"others are dropped before save."
+                    ),
+                })
+
             # Query queue: extend with extra phrases when DDG yields few PDFs / pages end — scales toward 100k+ targets
             DDG_QUERY_VARIATIONS = [
                 " list", " directory", " roster", " members", " membership",
@@ -622,6 +647,7 @@ class AutomationManager:
 
             while query_queue and not self.stop_flag:
                 query = query_queue.pop(0)
+                effective_query = apply_site_restriction_to_query(query, site_clause)
                 query_idx += 1
                 if (query or "").strip() in initial_queries_frozen:
                     variation_idx = 0
@@ -696,9 +722,10 @@ class AutomationManager:
 
                 try:
                     total_queued = query_idx + len(query_queue)
+                    q_preview = effective_query if len(effective_query) <= 72 else effective_query[:69] + "..."
                     await self.broadcast({
                         "type": "status",
-                        "message": f"--- Query {query_idx} (total in queue: {total_queued}): \"{query[:60]}{'...' if len(query) > 60 else ''}\" ---",
+                        "message": f"--- Query {query_idx} (total in queue: {total_queued}): \"{q_preview}\" ---",
                     })
 
                     # Reuse the same DB session for every queue item (variants included)
@@ -714,7 +741,7 @@ class AutomationManager:
                     # ─── DuckDuckGo flow (no CAPTCHA) ─────────────────────────────────────────
                     if search_engine == "duckduckgo":
                         # Add filetype:pdf if not present - dramatically improves PDF results
-                        q = query.strip()
+                        q = effective_query.strip()
                         if "filetype:pdf" not in q.lower() and "filetype: pdf" not in q.lower():
                             q = f"{q} filetype:pdf"
                         ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
@@ -810,10 +837,20 @@ class AutomationManager:
                                                     await self.broadcast({"type": "screenshot", "data": ss})
                                             pdf_leads = await self.extract_from_pdf(href, title, display_link)
                                             if pdf_leads:
-                                                for lead in pdf_leads:
-                                                    lead["search_query"] = query
-                                                query_leads.extend(pdf_leads)
-                                                total_leads_extracted += len(pdf_leads)
+                                                filtered_pdf, dom_drop = filter_leads_by_email_domains(
+                                                    pdf_leads, email_rules
+                                                )
+                                                if dom_drop:
+                                                    await self.broadcast({
+                                                        "type": "status",
+                                                        "message": f"  🎯 Email filter: dropped {dom_drop} lead(s) (not on allowlist)",
+                                                    })
+                                                if not filtered_pdf:
+                                                    continue
+                                                for lead in filtered_pdf:
+                                                    lead["search_query"] = effective_query
+                                                query_leads.extend(filtered_pdf)
+                                                total_leads_extracted += len(filtered_pdf)
                                                 await self.broadcast({"type": "lead_count", "count": total_leads_extracted, "target": target_leads})
                                                 try:
                                                     if master_search_id:
@@ -972,7 +1009,7 @@ class AutomationManager:
                         await search_box.click()
                         await asyncio.sleep(0.2)
                         await search_box.fill("")  # Clear first
-                        await search_box.fill(query)  # Instant paste - fast and reliable
+                        await search_box.fill(effective_query)  # Includes optional site: restriction
                         await asyncio.sleep(0.2)
                         
                         input_value = await search_box.input_value()
@@ -1018,7 +1055,7 @@ class AutomationManager:
                                 await asyncio.sleep(15)  # Wait for manual solve
                                 # Try to continue
                                 try:
-                                    await self.page.goto(f"https://www.google.com/search?q={quote_plus(query)}", wait_until="networkidle", timeout=30000)
+                                    await self.page.goto(f"https://www.google.com/search?q={quote_plus(effective_query)}", wait_until="networkidle", timeout=30000)
                                 except Exception:
                                     raise Exception("reCAPTCHA not solved")
                             pass  # URL might not change, continue anyway
@@ -1275,7 +1312,7 @@ class AutomationManager:
                                                     await self.page.go_back()
                                                     await self.page.wait_for_load_state("networkidle", timeout=10000)
                                                 except Exception:
-                                                    await self.page.goto(f"https://www.google.com/search?q={quote_plus(query)}", wait_until="networkidle", timeout=15000)
+                                                    await self.page.goto(f"https://www.google.com/search?q={quote_plus(effective_query)}", wait_until="networkidle", timeout=15000)
                                                 continue  # Skip this result
                                         else:
                                             await self.broadcast({
@@ -1311,35 +1348,46 @@ class AutomationManager:
                                         )
                                         
                                         if pdf_leads:
-                                            for lead in pdf_leads:
-                                                lead["search_query"] = query
-                                            query_leads.extend(pdf_leads)
-                                            total_leads_extracted += len(pdf_leads)
-                                            # Broadcast real-time update after each PDF
-                                            await self.broadcast({
-                                                "type": "lead_count",
-                                                "count": total_leads_extracted,
-                                                "target": target_leads,
-                                            })
-                                            await self.broadcast({
-                                                "type": "status",
-                                                "message": f"  ✅ [STEP 7.{pdf_count}] Extracted {len(pdf_leads)} leads | Total: {total_leads_extracted} leads",
-                                            })
-                                            
-                                            # Save immediately after each PDF (resilient - never lose leads)
-                                            try:
-                                                if master_search_id:
-                                                    save_leads(
-                                                        master_search_id,
-                                                        list(all_leads) + query_leads,
-                                                        replace=True,
-                                                    )
+                                            filtered_pdf, dom_drop = filter_leads_by_email_domains(
+                                                pdf_leads, email_rules
+                                            )
+                                            if dom_drop:
                                                 await self.broadcast({
                                                     "type": "status",
-                                                    "message": f"  💾 Saved to DB ({len(query_leads)} this pass, {len(all_leads) + len(query_leads)} cumulative)",
+                                                    "message": f"  🎯 Email filter: dropped {dom_drop} lead(s) (not on allowlist)",
                                                 })
-                                            except Exception as es:
-                                                await self.broadcast({"type": "status", "message": f"  ⚠️ Save error: {str(es)[:40]}"})
+                                            if not filtered_pdf:
+                                                await self.broadcast({
+                                                    "type": "status",
+                                                    "message": f"  ⚠️ [STEP 7.{pdf_count}] No leads left after domain filter",
+                                                })
+                                            else:
+                                                for lead in filtered_pdf:
+                                                    lead["search_query"] = effective_query
+                                                query_leads.extend(filtered_pdf)
+                                                total_leads_extracted += len(filtered_pdf)
+                                                await self.broadcast({
+                                                    "type": "lead_count",
+                                                    "count": total_leads_extracted,
+                                                    "target": target_leads,
+                                                })
+                                                await self.broadcast({
+                                                    "type": "status",
+                                                    "message": f"  ✅ [STEP 7.{pdf_count}] Extracted {len(filtered_pdf)} leads | Total: {total_leads_extracted} leads",
+                                                })
+                                                try:
+                                                    if master_search_id:
+                                                        save_leads(
+                                                            master_search_id,
+                                                            list(all_leads) + query_leads,
+                                                            replace=True,
+                                                        )
+                                                    await self.broadcast({
+                                                        "type": "status",
+                                                        "message": f"  💾 Saved to DB ({len(query_leads)} this pass, {len(all_leads) + len(query_leads)} cumulative)",
+                                                    })
+                                                except Exception as es:
+                                                    await self.broadcast({"type": "status", "message": f"  ⚠️ Save error: {str(es)[:40]}"})
                                         else:
                                             await self.broadcast({
                                                 "type": "status",
@@ -1360,7 +1408,7 @@ class AutomationManager:
                                                 await self.broadcast({"type": "screenshot", "data": screenshot})
                                         except Exception:
                                             # If back fails, navigate to Google search again
-                                            await self.page.goto(f"https://www.google.com/search?q={quote_plus(query)}", wait_until="networkidle", timeout=15000)
+                                            await self.page.goto(f"https://www.google.com/search?q={quote_plus(effective_query)}", wait_until="networkidle", timeout=15000)
                                         
                                     except Exception as e:
                                         import traceback
@@ -1374,7 +1422,7 @@ class AutomationManager:
                                             await self.page.go_back()
                                             await self.page.wait_for_load_state("networkidle", timeout=10000)
                                         except Exception:
-                                            await self.page.goto(f"https://www.google.com/search?q={quote_plus(query)}", wait_until="networkidle", timeout=15000)
+                                            await self.page.goto(f"https://www.google.com/search?q={quote_plus(effective_query)}", wait_until="networkidle", timeout=15000)
 
                                 except Exception:
                                     continue
@@ -1692,6 +1740,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         search_engine=search_engine,
                         headless=headless,
                         reload_between_queries=reload_between_queries,
+                        email_domain_allowlist=str(data.get("email_domain_allowlist") or "").strip(),
+                        search_site_domains=str(data.get("search_site_domains") or "").strip(),
                     ))
 
                 elif command == "stop":

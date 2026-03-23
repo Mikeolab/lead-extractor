@@ -260,6 +260,10 @@ if "search_engine" not in st.session_state:
     st.session_state.search_engine = st.session_state.settings.get("search_engine", "duckduckgo")
 if "live_queries_for_sessions" not in st.session_state:
     st.session_state.live_queries_for_sessions = []
+if "live_search_site_domains" not in st.session_state:
+    st.session_state.live_search_site_domains = st.session_state.settings.get("search_site_domains", "")
+if "live_email_domain_allowlist" not in st.session_state:
+    st.session_state.live_email_domain_allowlist = st.session_state.settings.get("email_domain_allowlist", "")
 
 
 # ─── WebSocket Client (URL from app.config, supports local + cloud) ───────────
@@ -268,9 +272,19 @@ if "live_queries_for_sessions" not in st.session_state:
 # Instead, put updates in a queue; main thread drains it and updates session state.
 
 
-def websocket_client(queries: List[str], max_pages: int, delay_pages: float, delay_actions: float,
-                    msg_queue: Queue, target_leads: int, search_engine: str, headless: bool,
-                    batch_reload: bool = False):
+def websocket_client(
+    queries: List[str],
+    max_pages: int,
+    delay_pages: float,
+    delay_actions: float,
+    msg_queue: Queue,
+    target_leads: int,
+    search_engine: str,
+    headless: bool,
+    batch_reload: bool = False,
+    email_domain_allowlist: str = "",
+    search_site_domains: str = "",
+):
     """Connect to WebSocket server. Callbacks put updates in msg_queue (no session state)."""
     def on_message(ws, message):
         try:
@@ -320,6 +334,8 @@ def websocket_client(queries: List[str], max_pages: int, delay_pages: float, del
             "search_engine": search_engine,
             "headless": headless,
             "reload_between_queries": batch_reload,
+            "email_domain_allowlist": email_domain_allowlist,
+            "search_site_domains": search_site_domains,
         }))
 
     try:
@@ -340,11 +356,33 @@ def websocket_client(queries: List[str], max_pages: int, delay_pages: float, del
         _ws_client_ref[0] = None
 
 
-def run_websocket_client(queries: List[str], max_pages: int, delay_pages: float, delay_actions: float,
-                        msg_queue: Queue, target_leads: int, search_engine: str, headless: bool,
-                        batch_reload: bool = False):
+def run_websocket_client(
+    queries: List[str],
+    max_pages: int,
+    delay_pages: float,
+    delay_actions: float,
+    msg_queue: Queue,
+    target_leads: int,
+    search_engine: str,
+    headless: bool,
+    batch_reload: bool = False,
+    email_domain_allowlist: str = "",
+    search_site_domains: str = "",
+):
     """Run WebSocket client in background thread."""
-    websocket_client(queries, max_pages, delay_pages, delay_actions, msg_queue, target_leads, search_engine, headless, batch_reload)
+    websocket_client(
+        queries,
+        max_pages,
+        delay_pages,
+        delay_actions,
+        msg_queue,
+        target_leads,
+        search_engine,
+        headless,
+        batch_reload,
+        email_domain_allowlist,
+        search_site_domains,
+    )
 
 
 def drain_ws_queue(msg_queue: Queue) -> bool:
@@ -552,6 +590,12 @@ def _render_live_query_sessions_panel():
 
     st.metric("Merged leads (raw, selected sessions)", len(merged))
 
+    st.text_area(
+        "Optional: email domain filter before download (one per line, same rules as Live allowlist)",
+        height=68,
+        key="live_export_email_domains",
+        help="Applied only to this export. Examples: `gmail.com`, `@outlook.com`, `*.edu`. Leave empty to skip.",
+    )
     export_mode = st.radio(
         "Export mode",
         [
@@ -564,13 +608,21 @@ def _render_live_query_sessions_panel():
     )
     use_full = "Full" in export_mode
     use_validation = "valid" in export_mode.lower()
+    _live_dom = (st.session_state.get("live_export_email_domains") or "").strip()
 
     export_leads, ex_stats = filter_merged_leads_for_export(
-        merged, use_full=use_full, use_validation=use_validation
+        merged,
+        use_full=use_full,
+        use_validation=use_validation,
+        email_domain_allowlist=_live_dom if _live_dom else None,
     )
 
     if use_full:
-        st.info(f"📋 {len(export_leads)} leads (full, no dedup)")
+        _dom = ex_stats.get("domain_filtered_count", 0)
+        _full_msg = f"📋 {len(export_leads)} leads (full, no dedup)"
+        if _dom:
+            _full_msg += f" — {_dom} row(s) removed by domain filter"
+        st.info(_full_msg)
     else:
         if use_validation:
             st.success(
@@ -592,6 +644,8 @@ def _render_live_query_sessions_panel():
             if use_validation:
                 st.markdown(f"- **Invalid format:** {ex_stats['invalid_count']} (failed `email_validator`, same as Saved Leads)")
             st.markdown(f"- **Duplicate email:** {ex_stats['dup_count']}")
+            if ex_stats.get("domain_filtered_count", 0):
+                st.markdown(f"- **Domain filter (export):** {ex_stats['domain_filtered_count']}")
 
     if not export_leads:
         st.warning(
@@ -818,6 +872,27 @@ def render_extractor_page():
             )
             st.session_state.target_lead_count = target_leads
 
+        st.markdown("**Domain targeting**")
+        st.caption(
+            "Use **websites** to narrow what the search engine returns (`site:` operator). "
+            "Use **email allowlist** to drop extracted rows that do not match (e.g. only `.edu` or only your org). "
+            "Syntax: `app/filters/email_domain_rules.py`."
+        )
+        st.text_area(
+            "Restrict search to these websites (optional, one domain per line)",
+            height=72,
+            key="live_search_site_domains",
+            help="Example: `state.gov` or `university.edu`. Adds (site:x OR site:y) to every query. "
+            "Wildcard lines like `*.edu` are ignored here — use the email allowlist for *.edu.",
+        )
+        st.text_area(
+            "Only save leads with email on these domains (optional)",
+            height=72,
+            key="live_email_domain_allowlist",
+            help="Examples: gmail.com | @company.org | *.edu (any .edu address). "
+            "Empty = keep all. Applied as soon as leads are extracted.",
+        )
+
     st.divider()
 
     # ── Query input (Start immediately follows) ───────────────────────────
@@ -921,7 +996,19 @@ def render_extractor_page():
             batch_reload = bool(batch_mode and st.session_state.get("batch_reload", True))
             thread = threading.Thread(
                 target=run_websocket_client,
-                args=(queries, max_pages, delay_pages, delay_actions, msg_queue, target_leads, search_engine, headless, batch_reload),
+                args=(
+                    queries,
+                    max_pages,
+                    delay_pages,
+                    delay_actions,
+                    msg_queue,
+                    target_leads,
+                    search_engine,
+                    headless,
+                    batch_reload,
+                    str(st.session_state.get("live_email_domain_allowlist", "") or ""),
+                    str(st.session_state.get("live_search_site_domains", "") or ""),
+                ),
                 daemon=True,
             )
             thread.start()
@@ -1166,6 +1253,12 @@ def render_saved_leads_page():
                 lead_copy["_session_id"] = sid
                 all_merged.append(lead_copy)
 
+        st.text_area(
+            "Optional: email domain filter before download (one per line)",
+            height=68,
+            key="saved_export_email_domains",
+            help="Examples: `gmail.com`, `*.gov`, `@company.com`. Leave empty to skip.",
+        )
         # Export mode: Full | Unique (dedup only) | Unique valid (dedup + validation)
         export_mode = st.radio(
             "Export mode",
@@ -1179,13 +1272,21 @@ def render_saved_leads_page():
         )
         use_full = "Full" in export_mode
         use_validation = "valid" in export_mode.lower()
+        _saved_dom = (st.session_state.get("saved_export_email_domains") or "").strip()
 
         export_leads, ex_stats = filter_merged_leads_for_export(
-            all_merged, use_full=use_full, use_validation=use_validation
+            all_merged,
+            use_full=use_full,
+            use_validation=use_validation,
+            email_domain_allowlist=_saved_dom if _saved_dom else None,
         )
 
         if use_full:
-            st.info(f"📋 {len(export_leads)} leads (full, no dedup)")
+            _doms = ex_stats.get("domain_filtered_count", 0)
+            _fmsg = f"📋 {len(export_leads)} leads (full, no dedup)"
+            if _doms:
+                _fmsg += f" — {_doms} row(s) removed by domain filter"
+            st.info(_fmsg)
         else:
             if use_validation:
                 st.success(
@@ -1207,6 +1308,8 @@ def render_saved_leads_page():
                 if use_validation:
                     st.markdown(f"- **Invalid format:** {ex_stats['invalid_count']} (failed email validation)")
                 st.markdown(f"- **Duplicate:** {ex_stats['dup_count']} (same email already seen)")
+                if ex_stats.get("domain_filtered_count", 0):
+                    st.markdown(f"- **Domain filter (export):** {ex_stats['domain_filtered_count']}")
                 st.caption("Try **Full** to export everything, or **Unique (dedup only)** if validation drops too many.")
 
         # Column filter

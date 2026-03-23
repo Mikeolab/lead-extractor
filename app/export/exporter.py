@@ -133,22 +133,32 @@ def filter_merged_leads_for_export(
     *,
     use_full: bool,
     use_validation: bool,
+    email_domain_allowlist: str | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
     """
     Same pipeline for Saved Leads and Live "saved sessions" merge:
     - Full: return rows as-is (no split, no dedupe).
     - Unique: split multi-address cells, dedupe by normalized email.
     - Unique valid: same as Unique plus email_validator (check_deliverability=False).
+    Optional email_domain_allowlist: keep only rows where at least one email matches
+    (see app.filters.email_domain_rules for *.edu / domain syntax).
     """
+    from app.filters.email_domain_rules import parse_email_domain_allowlist, filter_leads_by_email_domains
+
     stats: dict[str, int] = {
         "merged_raw": len(merged),
         "rows_after_split": len(merged),
         "no_email_count": 0,
         "invalid_count": 0,
         "dup_count": 0,
+        "domain_filtered_count": 0,
     }
+    domain_rules = parse_email_domain_allowlist(email_domain_allowlist)
+
     if use_full:
-        return list(merged), stats
+        out, dropped = filter_leads_by_email_domains(merged, domain_rules)
+        stats["domain_filtered_count"] = dropped
+        return out, stats
 
     work = expand_merged_leads_per_email_field(merged)
     stats["rows_after_split"] = len(work)
@@ -175,6 +185,9 @@ def filter_merged_leads_for_export(
             unique.append(l_copy)
         else:
             stats["dup_count"] += 1
+
+    unique, dropped_dom = filter_leads_by_email_domains(unique, domain_rules)
+    stats["domain_filtered_count"] = dropped_dom
     return unique, stats
 
 

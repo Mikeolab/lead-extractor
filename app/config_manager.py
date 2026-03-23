@@ -32,6 +32,8 @@ def load_settings() -> Dict[str, Any]:
         "show_browser": True,  # Show live browser view in UI
         "delay_actions": 1.0,
         "filter_domains": "",
+        "search_site_domains": "",  # site: restriction for each live search (one host per line)
+        "email_domain_allowlist": "",  # only keep leads whose email matches (live save + optional default)
         "filter_filetypes": "",
         "max_depth": 3,
     }
