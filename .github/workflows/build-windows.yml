@@ -1,12 +1,12 @@
-# Build Windows .exe automatically - no manual CMD needed
-# Push code → GitHub builds on Windows → Download the .exe
+# Build Windows .exe automatically — push code, GitHub builds on Windows, download the .exe
+# Trigger: push to main/master OR manual "Run workflow" button in Actions tab
 
 name: Build Windows EXE
 
 on:
   push:
     branches: [main, master]
-  workflow_dispatch:  # Allow manual "Run workflow" button
+  workflow_dispatch:
 
 jobs:
   build:
@@ -16,23 +16,43 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install pip and dependencies
+      - name: Install dependencies
+        shell: cmd
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Build executable
+      - name: Install Playwright Chromium into playwright_browsers/
+        shell: cmd
         run: |
+          set PLAYWRIGHT_BROWSERS_PATH=%CD%\playwright_browsers
+          python -m playwright install chromium --with-deps
+
+      - name: Build Windows EXE
+        shell: cmd
+        run: |
+          set PLAYWRIGHT_BROWSERS_PATH=%CD%\playwright_browsers
           python -m PyInstaller --clean --noconfirm LeadExtractorPro_windows.spec
+
+      - name: Verify EXE was created
+        shell: cmd
+        run: |
+          if not exist "dist\LeadExtractorPro.exe" (
+            echo ERROR: dist\LeadExtractorPro.exe not found
+            exit /b 1
+          )
+          dir dist\LeadExtractorPro.exe
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
-          name: LeadExtractorPro-Windows
+          name: LeadExtractorPro-Windows-${{ github.sha }}
           path: dist/LeadExtractorPro.exe
+          retention-days: 30

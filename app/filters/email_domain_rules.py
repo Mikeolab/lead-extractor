@@ -172,35 +172,130 @@ def filter_leads_by_email_domains(
     return kept, dropped
 
 
-def parse_site_domains_for_search(text: str | None) -> list[str]:
+# Users often enter the *search engine* or a social app here. `site:google.com` does NOT mean
+# “search with Google” — it means “only pages whose URL is on google.com”, which kills PDF discovery.
+_SITE_HOST_SEARCH_AND_SOCIAL_PORTALS = frozenset(
+    {
+        "google.com",
+        "gstatic.com",
+        "googleusercontent.com",
+        "facebook.com",
+        "fb.com",
+        "m.facebook.com",
+        "instagram.com",
+        "threads.net",
+        "twitter.com",
+        "x.com",
+        "t.co",
+        "linkedin.com",
+        "bing.com",
+        "duckduckgo.com",
+        "yahoo.com",
+        "msn.com",
+        "youtube.com",
+        "youtu.be",
+        "tiktok.com",
+        "pinterest.com",
+        "snapchat.com",
+    }
+)
+
+
+def _registrable_root_for_portal_check(hostname: str) -> str:
+    h = (hostname or "").strip().lower().rstrip(".")
+    if h.startswith("www."):
+        h = h[4:]
+    return h
+
+
+def _is_blocked_search_portal_domain(hostname: str) -> bool:
+    root = _registrable_root_for_portal_check(hostname)
+    if root in _SITE_HOST_SEARCH_AND_SOCIAL_PORTALS:
+        return True
+    # e.g. mail.google.com, apis.google.com
+    for portal in ("google.com", "facebook.com", "yahoo.com", "bing.com"):
+        if root == portal or root.endswith("." + portal):
+            return True
+    return False
+
+
+def parse_site_domains_for_search(text: str | None) -> tuple[list[str], list[str]]:
     """
     Domains for site: operator. Ignores *.wildcard-only lines (not valid for site:).
+
+    Returns (accepted_domains, skipped_portal_domains). Portal/social/search domains are skipped
+    because they almost never host the PDF rosters this app looks for, and they confuse users.
     """
     out: list[str] = []
+    skipped: list[str] = []
     seen: set[str] = set()
+    seen_skip: set[str] = set()
     for raw in _split_lines_and_commas(text):
         r = raw.strip().lower()
         if r.startswith("*.") or (r.startswith(".") and len(r) > 1):
             continue
         d = normalize_domain_token(raw)
-        if d and d not in seen:
-            seen.add(d)
-            out.append(d)
-    return out
+        if not d or d in seen or d in seen_skip:
+            continue
+        if _is_blocked_search_portal_domain(d):
+            seen_skip.add(d)
+            skipped.append(d)
+            continue
+        seen.add(d)
+        out.append(d)
+    return out, skipped
 
 
-def build_site_restriction_clause(site_domains_text: str | None) -> str:
-    """
-    Build a search-engine clause: (site:a.com OR site:b.org)
-    Empty if no valid domains.
-    """
-    domains = parse_site_domains_for_search(site_domains_text)
+def domains_to_site_clause(domains: list[str]) -> str:
+    """Build (site:a OR site:b) from normalized host list."""
     if not domains:
         return ""
     parts = [f"site:{d}" for d in domains]
     if len(parts) == 1:
         return parts[0]
     return "(" + " OR ".join(parts) + ")"
+
+
+def _is_pdf_rare_site_host(normalized_domain: str) -> bool:
+    """
+    Hosts where forcing filetype:pdf on every query almost always yields empty SERPs
+    (discussion / social threads, not PDF file servers).
+    """
+    d = (normalized_domain or "").strip().lower().rstrip(".")
+    if not d:
+        return False
+    if d == "redd.it" or d.endswith(".redd.it"):
+        return True
+    if d == "reddit.com" or d.endswith(".reddit.com"):
+        return True
+    return False
+
+
+def site_restriction_targets_only_pdf_rare_hosts(accepted_domains: list[str]) -> bool:
+    """
+    True when every accepted site: host is PDF-rare (e.g. only Reddit).
+    DuckDuckGo flow should omit filetype:pdf and may scrape thread HTML from result URLs.
+    """
+    if not accepted_domains:
+        return False
+    return all(_is_pdf_rare_site_host(x) for x in accepted_domains)
+
+
+def build_site_restriction_clause(site_domains_text: str | None) -> str:
+    """
+    Build a search-engine clause: (site:a.com OR site:b.org)
+    Empty if no valid domains. Drops search/social portal domains (see parse_site_domains_for_search).
+    """
+    domains, _skipped = parse_site_domains_for_search(site_domains_text)
+    return domains_to_site_clause(domains)
+
+
+def prepare_site_restriction_for_automation(site_domains_text: str | None) -> tuple[str, list[str], list[str]]:
+    """
+    Returns (site_clause, skipped_portal_domains, accepted_domains) for automation + messaging.
+    """
+    domains, skipped = parse_site_domains_for_search(site_domains_text)
+    return domains_to_site_clause(domains), skipped, domains
 
 
 def apply_site_restriction_to_query(query: str, site_clause: str) -> str:

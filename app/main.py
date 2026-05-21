@@ -39,7 +39,16 @@ from app.export.exporter import (
 )
 from app.export.pdf_exporter import export_to_pdf
 from app.config_manager import load_settings, save_settings
-from app.email.email_ui import render_email_sender_page
+from app.lead_manager import (
+    upload_leads_from_file,
+    save_external_leads,
+    get_external_leads,
+    get_domain_statistics,
+    delete_external_leads,
+    compare_with_extracted_leads,
+)
+from app.lead_manager.validator import validate_email
+from app.lead_manager.domain_filter import filter_leads_by_domain, get_domain_stats
 
 
 # ─── Page Config ─────────────────────────────────────────────────────────────
@@ -264,6 +273,36 @@ if "live_search_site_domains" not in st.session_state:
     st.session_state.live_search_site_domains = st.session_state.settings.get("search_site_domains", "")
 if "live_email_domain_allowlist" not in st.session_state:
     st.session_state.live_email_domain_allowlist = st.session_state.settings.get("email_domain_allowlist", "")
+if "query_current" not in st.session_state:
+    st.session_state.query_current = ""
+if "query_progress_idx" not in st.session_state:
+    st.session_state.query_progress_idx = 0
+if "query_total" not in st.session_state:
+    st.session_state.query_total = 0
+if "emails_collected" not in st.session_state:
+    st.session_state.emails_collected = 0
+if "ext_leads_last_imported" not in st.session_state:
+    st.session_state.ext_leads_last_imported = 0
+
+
+def generate_queries(footprints: list, patterns: list, locations: list) -> list:
+    """Cross-product: footprint × @pattern × location → list of search query strings."""
+    queries = []
+    for fp in footprints:
+        fp = fp.strip()
+        if not fp:
+            continue
+        for pat in patterns:
+            pat = pat.strip().lstrip("@")
+            if not pat:
+                continue
+            for loc in locations:
+                loc = loc.strip()
+                if not loc:
+                    continue
+                q = f'{fp} "@{pat}" {loc}'
+                queries.append(q)
+    return queries
 
 
 # ─── WebSocket Client (URL from app.config, supports local + cloud) ───────────
@@ -300,6 +339,12 @@ def websocket_client(
                 msg_queue.put(("leads", data.get("data", [])))
             elif msg_type == "lead_count":
                 msg_queue.put(("lead_count", (data.get("count", 0), data.get("target", 0))))
+            elif msg_type == "query_progress":
+                msg_queue.put(("query_progress", {
+                    "current_query": data.get("current_query", ""),
+                    "current": data.get("current", 0),
+                    "total": data.get("total", 0),
+                }))
             elif msg_type == "file_saved":
                 msg_queue.put(("file_saved", {
                     "path": data.get("path", ""),
@@ -419,8 +464,15 @@ def drain_ws_queue(msg_queue: Queue) -> bool:
             changed = True
         elif msg_type == "lead_count":
             st.session_state.current_lead_count, st.session_state.target_lead_count = data
+            st.session_state.emails_collected = data[0]
             st.session_state.needs_refresh = True
             st.session_state.last_update = time.time()
+            changed = True
+        elif msg_type == "query_progress":
+            st.session_state.query_current = data.get("current_query", "")
+            st.session_state.query_progress_idx = data.get("current", 0)
+            st.session_state.query_total = data.get("total", 0)
+            st.session_state.needs_refresh = True
             changed = True
         elif msg_type == "file_saved":
             st.session_state.saved_files.append(data)
@@ -431,6 +483,7 @@ def drain_ws_queue(msg_queue: Queue) -> bool:
                 st.session_state.extracted_leads = data
             st.session_state.activity_log.append("🎉 Automation completed!")
             st.session_state.is_running = False
+            st.session_state.query_current = "✅ Done"
             st.session_state.needs_refresh = True
             st.session_state.last_update = time.time()
             st.session_state._terminal_rerun = True
@@ -513,6 +566,35 @@ def _live_automation_fragment():
         st.rerun()
     if not st.session_state.is_running:
         return
+
+    # Status dashboard inside fragment so metrics update every 1.15s during a run
+    q_current = st.session_state.get("query_current", "")
+    q_idx = st.session_state.get("query_progress_idx", 0)
+    q_total = st.session_state.get("query_total", 1)
+    emails_col = st.session_state.get("emails_collected", 0)
+    if q_current:
+        st.markdown(
+            f'<div class="extraction-status-bar"><span class="live-dot"></span>'
+            f'<strong>Now running:</strong> <code>{_escape_html(q_current)}</code></div>',
+            unsafe_allow_html=True,
+        )
+    dash_c1, dash_c2 = st.columns(2)
+    with dash_c1:
+        st.metric("Collected emails", emails_col)
+    with dash_c2:
+        st.metric("Progress", f"{q_idx} / {q_total} queries")
+        if q_total > 0:
+            st.progress(min(1.0, q_idx / q_total))
+        if st.session_state.extracted_leads:
+            _dl_df = leads_to_dataframe(st.session_state.extracted_leads)
+            st.download_button(
+                "⬇️ Download collected",
+                data=_dl_df.to_csv(index=False),
+                file_name="leads_in_progress.csv",
+                mime="text/csv",
+                key="dl_mid_run",
+            )
+
     _render_live_panel_content(extracting=True)
 
 
@@ -783,7 +865,7 @@ def render_sidebar():
 
 
 # ─── Top Navigation (single widget key = source of truth; avoids mixed tabs) ─
-NAV_OPTIONS = ["🔍 Live Extractor", "📋 Saved Leads", "📧 Email Sender", "⚙️ Settings"]
+NAV_OPTIONS = ["🔍 Live Extractor", "📋 Saved Leads", "⚙️ Settings"]
 
 
 def render_bottom_navigation():
@@ -808,138 +890,120 @@ def render_bottom_navigation():
 
 # ─── Main Extractor Page ─────────────────────────────────────────────────────
 def render_extractor_page():
-    # Drain queue without full-page rerun while running (live UI uses st.fragment)
+    import platform, subprocess
     q = st.session_state.get("ws_message_queue")
     drain_ws_queue(q)
 
-    st.markdown('<p class="app-title">Live extraction</p>', unsafe_allow_html=True)
+    st.markdown('<p class="app-title">Live Extraction</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="app-subtitle">Search results and PDF processing run in the browser. Open Settings below when you need to tune behavior.</p>',
+        '<p class="app-subtitle">Build queries from three lists — runs all combinations automatically until complete.</p>',
         unsafe_allow_html=True,
     )
 
-    # ── Settings (collapsed by default) ─────────────────────────────────────
-    with st.expander("Settings", expanded=False):
+    # ── Settings (collapsed) ─────────────────────────────────────────────────
+    with st.expander("⚙️ Settings", expanded=False):
         col1, col2 = st.columns(2)
-
         with col1:
             st.markdown("**Automation**")
             max_pages = st.number_input(
-                "Max pages per query",
-                min_value=1,
-                max_value=500,
-                value=int(st.session_state.settings.get("max_pages", 10)),
-                step=1,
-                help="Higher values scan more result pages per query variant. Use larger numbers for very high volume targets.",
+                "Max pages per query", min_value=1, max_value=500,
+                value=int(st.session_state.settings.get("max_pages", 10)), step=1,
+                key="ext_max_pages",
             )
             st.session_state.settings["max_pages"] = max_pages
             delay_pages = st.number_input(
-                "Delay between pages (seconds)",
-                min_value=0.0,
-                max_value=10.0,
-                value=3.0,
-                step=0.5,
+                "Delay between pages (s)", min_value=0.0, max_value=10.0, value=3.0, step=0.5,
+                key="ext_delay_pages",
             )
             delay_actions = st.number_input(
-                "Action delay (seconds)",
-                min_value=0.0,
-                max_value=5.0,
-                value=1.0,
-                step=0.1,
+                "Action delay (s)", min_value=0.0, max_value=5.0, value=1.0, step=0.1,
+                key="ext_delay_actions",
             )
-
         with col2:
             st.markdown("**Connection**")
-            st.caption("**Search provider** is set in the left sidebar under **Engine**.")
             headless_live = st.checkbox(
                 "Run headless (no browser window)",
                 value=bool(st.session_state.settings.get("headless", False)),
                 key="live_headless",
-                help="No visible browser window. Activity still appears in the log; extraction continues normally.",
             )
             st.session_state.settings["headless"] = headless_live
-            if headless_live:
-                st.caption("Headless mode: log and lead counts still update live.")
-            server_url = st.text_input("Server URL", value=WEBSOCKET_URL, help="WebSocket endpoint for the automation service")
-            auto_save = st.checkbox("Save results to database", value=True)
             target_leads = st.number_input(
-                "Target lead count (0 = no limit)",
-                min_value=0,
-                max_value=500000,
-                value=int(st.session_state.get("target_lead_count", 0)),
-                step=500,
-                help="Optional cap. Additional query phrases may be used automatically when results are below the soft threshold. 0 leaves volume uncapped.",
+                "Target lead count (0 = no limit)", min_value=0, max_value=500000,
+                value=int(st.session_state.get("target_lead_count", 0)), step=500,
+                key="ext_target_leads",
             )
             st.session_state.target_lead_count = target_leads
-
         st.markdown("**Domain targeting**")
-        st.caption(
-            "Use **websites** to narrow what the search engine returns (`site:` operator). "
-            "Use **email allowlist** to drop extracted rows that do not match (e.g. only `.edu` or only your org). "
-            "Syntax: `app/filters/email_domain_rules.py`."
+        st.text_area(
+            "Restrict search to these websites (optional, one per line)",
+            height=80, key="live_search_site_domains",
+            help="e.g. state.gov · university.edu. Do NOT list google.com/facebook.com.",
         )
         st.text_area(
-            "Restrict search to these websites (optional, one domain per line)",
-            height=72,
-            key="live_search_site_domains",
-            help="Example: `state.gov` or `university.edu`. Adds (site:x OR site:y) to every query. "
-            "Wildcard lines like `*.edu` are ignored here — use the email allowlist for *.edu.",
-        )
-        st.text_area(
-            "Only save leads with email on these domains (optional)",
-            height=72,
-            key="live_email_domain_allowlist",
-            help="Examples: gmail.com | @company.org | *.edu (any .edu address). "
-            "Empty = keep all. Applied as soon as leads are extracted.",
+            "Only keep leads with email on these domains (optional)",
+            height=80, key="live_email_domain_allowlist",
+            help="e.g. gmail.com | @company.org | *.edu",
         )
 
     st.divider()
 
-    # ── Query input (Start immediately follows) ───────────────────────────
-    st.markdown("### Search query")
+    # ── Query Builder — three panels ─────────────────────────────────────────
+    st.markdown("### Query Builder")
     st.caption(
-        "Only **PDF** links from results are processed. `filetype:pdf` is applied automatically when you omit it. "
-        "Describe **who or what** and **where** (or sector); extra phrases are added automatically when results are thin."
-    )
-    query_input = st.text_area(
-        "Query",
-        height=70,
-        label_visibility="collapsed",
-        placeholder=(
-            "Example: nonprofit chamber of commerce members Denver Colorado\n"
-            "Organization type, audience or role, and location — adjust as needed."
-        ),
-        key="query_input",
+        "Fill each column — every combination of **Footprint × @Pattern × Location** becomes one search query. "
+        "Queries run automatically in sequence."
     )
 
-    with st.expander("Batch mode (multiple queries)", expanded=False):
-        st.text_area(
-            "Up to 10 queries (one per line)",
-            height=150,
-            placeholder=(
-                "rotary club officers Seattle Washington\n"
-                "HOA board of directors contact Austin Texas\n"
-                "small business association membership roster Chicago Illinois"
-            ),
-            key="batch_queries",
-            help="When this box has text, it replaces the single query above. Reload between queries is recommended for reliability.",
+    col_fp, col_pat, col_loc = st.columns(3)
+    with col_fp:
+        st.markdown("**Site Footprint**")
+        footprint_text = st.text_area(
+            "footprint", height=160, label_visibility="collapsed", key="qb_footprint",
+            placeholder="Pilot\nWrestler\nStartups\nNon-profit\nChurch",
         )
-        st.checkbox(
-            "Reload browser between each query",
-            value=True,
-            key="batch_reload",
-            help="Closes and restarts the browser after each line — reduces stuck sessions on long batches.",
+    with col_pat:
+        st.markdown("**@ Patterns**")
+        patterns_text = st.text_area(
+            "patterns", height=160, label_visibility="collapsed", key="qb_patterns",
+            placeholder="@comcast.net\n@gmail.com\n@yahoo.com\n@outlook.com",
+        )
+    with col_loc:
+        st.markdown("**Location / Role**")
+        locations_text = st.text_area(
+            "locations", height=160, label_visibility="collapsed", key="qb_locations",
+            placeholder="Governors\nScientist\nhuman resources\nChicago\nTexas",
         )
 
-    _batch_raw = (st.session_state.get("batch_queries") or "").strip()
-    batch_mode = bool(_batch_raw) and any(line.strip() for line in _batch_raw.split("\n"))
+    footprints = [l.strip() for l in footprint_text.split("\n") if l.strip()]
+    patterns = [l.strip() for l in patterns_text.split("\n") if l.strip()]
+    locations = [l.strip() for l in locations_text.split("\n") if l.strip()]
+    total_queries = len(footprints) * len(patterns) * len(locations)
 
-    # ── Controls (immediately after query / batch) ──────────────────────────
+    # ── Query count + inline controls ───────────────────────────────────────
+    col_count, col_ctrl = st.columns([2, 1])
+    with col_count:
+        if total_queries > 0:
+            st.success(
+                f"**{len(footprints)} × {len(patterns)} × {len(locations)} = {total_queries:,} queries** ready"
+            )
+        else:
+            st.info("Add at least one entry in each column to generate queries.")
+    with col_ctrl:
+        delay_queries = st.number_input(
+            "Delay between queries (s)", min_value=0, max_value=99, value=0, step=1,
+            key="qb_delay_queries",
+        )
+        remove_dupes = st.checkbox("Remove duplicates", value=True, key="qb_remove_dupes")
+
+    # ── Action buttons ────────────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        start_btn = st.button("Start", type="primary", use_container_width=True, disabled=st.session_state.is_running)
+        start_btn = st.button(
+            "▶ Start", type="primary", use_container_width=True,
+            disabled=st.session_state.is_running or total_queries == 0,
+        )
     with c2:
-        stop_btn = st.button("Stop", use_container_width=True, disabled=not st.session_state.is_running)
+        stop_btn = st.button("■ Stop", use_container_width=True, disabled=not st.session_state.is_running)
     with c3:
         clear_btn = st.button("Clear", use_container_width=True)
     with c4:
@@ -949,6 +1013,10 @@ def render_extractor_page():
         st.session_state.activity_log = []
         st.session_state.extracted_leads = []
         st.session_state.current_screenshot = None
+        st.session_state.query_current = ""
+        st.session_state.query_progress_idx = 0
+        st.session_state.query_total = 0
+        st.session_state.emails_collected = 0
         st.rerun()
 
     if stop_btn:
@@ -956,11 +1024,8 @@ def render_extractor_page():
         ws = _ws_client_ref[0] if _ws_client_ref else None
         if ws:
             try:
-                if hasattr(ws, "send"):
-                    ws.send(json.dumps({"command": "stop"}))
-                    st.session_state.activity_log.append("Stop sent to automation service.")
-                else:
-                    st.session_state.activity_log.append("Stop requested (connection closing).")
+                ws.send(json.dumps({"command": "stop"}))
+                st.session_state.activity_log.append("Stop sent to automation service.")
             except Exception as e:
                 st.session_state.activity_log.append(f"Stop requested ({str(e)[:50]}).")
         else:
@@ -968,51 +1033,45 @@ def render_extractor_page():
         st.rerun()
 
     if start_btn:
-        btxt = st.session_state.get("batch_queries") or ""
-        queries: List[str] = []
-        if batch_mode and btxt.strip():
-            queries = [q.strip() for q in btxt.split("\n") if q.strip()][:10]
-            if len([q for q in btxt.split("\n") if q.strip()]) > 10:
-                st.warning("Only the first 10 queries will run.")
-        else:
-            qi = (st.session_state.get("query_input") or "").strip()
-            if qi:
-                queries = [qi]
-
+        queries = generate_queries(footprints, patterns, locations)
         if not queries:
-            st.warning("Enter a search query, or add lines under Batch mode.")
+            st.warning("Need at least one entry in each column (Footprint, @Pattern, Location).")
         else:
             st.session_state.is_running = True
             st.session_state.extracted_leads = []
             st.session_state.activity_log = []
             st.session_state.current_screenshot = None
             st.session_state.saved_files = []
+            st.session_state.query_current = ""
+            st.session_state.query_progress_idx = 0
+            st.session_state.query_total = len(queries)
+            st.session_state.emails_collected = 0
 
             msg_queue = Queue()
             st.session_state.ws_message_queue = msg_queue
-            target_leads = st.session_state.get("target_lead_count", 0)
-            search_engine = st.session_state.get("search_engine", "duckduckgo")
-            headless = bool(st.session_state.settings.get("headless", False))
-            batch_reload = bool(batch_mode and st.session_state.get("batch_reload", True))
+            _target = st.session_state.get("target_lead_count", 0)
+            _engine = st.session_state.get("search_engine", "duckduckgo")
+            _headless = bool(st.session_state.settings.get("headless", False))
+            _delay_p = float(delay_queries) if delay_queries > 0 else float(delay_pages)
             thread = threading.Thread(
                 target=run_websocket_client,
                 args=(
                     queries,
-                    max_pages,
-                    delay_pages,
-                    delay_actions,
+                    int(max_pages),
+                    _delay_p,
+                    float(delay_actions),
                     msg_queue,
-                    target_leads,
-                    search_engine,
-                    headless,
-                    batch_reload,
+                    int(_target),
+                    _engine,
+                    _headless,
+                    False,
                     str(st.session_state.get("live_email_domain_allowlist", "") or ""),
                     str(st.session_state.get("live_search_site_domains", "") or ""),
                 ),
                 daemon=True,
             )
             thread.start()
-            st.session_state.live_queries_for_sessions = list(queries)
+            st.session_state.live_queries_for_sessions = list(queries[:10])
             st.rerun()
 
     if check_srv_clicked:
@@ -1029,82 +1088,67 @@ def render_extractor_page():
         except Exception as e:
             st.session_state.websocket_connected = False
             st.error(f"Server not reachable: {str(e)[:50]}")
-            st.caption("Ensure the automation service is running.")
 
-    # ── Status Bar with Real-time Lead Count ─────────────────────────────
-    status_text = "Ready" if not st.session_state.is_running else "🔄 Running..."
-    if st.session_state.websocket_connected:
-        status_text += " | ✅ Connected"
-    else:
-        status_text += " | ⚠️ Not Connected"
-    
-    # Add real-time lead count
-    current_count = st.session_state.get("current_lead_count", 0)
-    target_count = st.session_state.get("target_lead_count", 0)
-    if current_count > 0:
-        if target_count > 0:
-            status_text += f" | 📊 Leads: {current_count}/{target_count}"
-        else:
-            status_text += f" | 📊 Leads: {current_count}"
-    
+    # ── Live Status Dashboard ─────────────────────────────────────────────────
+    # Shown here only when NOT running (final / "Done" state after completion).
+    # During a run this block lives inside _live_automation_fragment() so it
+    # updates every 1.15 s without a full-page rerun.
+    is_running = st.session_state.is_running
+    q_current = st.session_state.get("query_current", "")
+    q_idx = st.session_state.get("query_progress_idx", 0)
+    q_total = st.session_state.get("query_total", total_queries or 1)
+    emails_col = st.session_state.get("emails_collected", 0)
+
+    if not is_running and q_current:
+        st.divider()
+        dash_c1, dash_c2 = st.columns(2)
+        with dash_c1:
+            st.markdown(
+                f'<div class="extraction-status-bar">'
+                f'<strong>Last run:</strong> <code>{_escape_html(q_current)}</code></div>',
+                unsafe_allow_html=True,
+            )
+            st.metric("Collected emails", emails_col)
+        with dash_c2:
+            st.metric("Progress", f"{q_idx} / {q_total} queries")
+            if q_total > 0:
+                st.progress(min(1.0, q_idx / q_total))
+            if st.session_state.extracted_leads:
+                _dl_df = leads_to_dataframe(st.session_state.extracted_leads)
+                st.download_button(
+                    "⬇️ Download collected",
+                    data=_dl_df.to_csv(index=False),
+                    file_name="leads_in_progress.csv",
+                    mime="text/csv",
+                    key="dl_mid_run",
+                )
+
+    # ── Connection status bar ────────────────────────────────────────────────
+    status_text = "🔄 Running..." if is_running else "Ready"
+    status_text += " | ✅ Connected" if st.session_state.websocket_connected else " | ⚠️ Not Connected"
     st.markdown(f'<div class="status-bar">{status_text}</div>', unsafe_allow_html=True)
-    
-    # Real-time lead count display (prominent)
-    if st.session_state.is_running and current_count > 0:
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("📊 Current Leads", current_count)
-        with col2:
-            if target_count > 0:
-                remaining = max(0, target_count - current_count)
-                st.metric("🎯 Target", target_count, delta=f"{remaining} remaining" if remaining > 0 else "Reached!")
-            else:
-                st.metric("🎯 Target", "No limit")
-        with col3:
-            if target_count > 0 and current_count > 0:
-                progress = min(100, (current_count / target_count) * 100)
-                st.progress(progress / 100)
-                st.caption(f"{progress:.1f}% complete")
 
-    # ── Browser visibility tip (platform-specific) ─────────────────────────
-    import platform
-    if platform.system() == "Darwin":
-        st.info(
-            "**Browser window not visible?** Open **Settings** and enable **Run headless**, or launch from Terminal with "
-            "`START_LEAD_EXTRACTOR.command` for a visible browser window."
-        )
-    elif platform.system() == "Windows":
-        st.info(
-            "**Browser window not visible?** Open **Settings** and enable **Run headless**, or use **Launch in CMD** below."
-        )
-
-    # ── Launch in Terminal/CMD (for visible browser) ───────────────────────
-    import subprocess
+    # ── Platform launch helpers ──────────────────────────────────────────────
     proj = Path(__file__).resolve().parent.parent
     if platform.system() == "Darwin":
-        if st.button("Launch in Terminal (visible browser)", key="launch_terminal", help="Opens macOS Terminal if the in-app browser does not appear"):
+        if st.button("Launch in Terminal (visible browser)", key="launch_terminal"):
             try:
                 cmd = f"cd {proj} && python3 launch_app_simple.py"
-                script = f'tell application "Terminal" to do script "{cmd}"'
-                subprocess.run(["osascript", "-e", script], check=False, timeout=5)
-                st.success("Terminal opened. Use the app there — the browser will pop up when you click Start.")
+                subprocess.run(["osascript", "-e", f'tell application "Terminal" to do script "{cmd}"'], check=False, timeout=5)
+                st.success("Terminal opened.")
             except Exception as e:
                 st.error(f"Could not open Terminal: {e}")
     elif platform.system() == "Windows":
-        if st.button("Launch in CMD (visible browser)", key="launch_cmd", help="Opens Command Prompt if the in-app browser does not appear"):
+        if st.button("Launch in CMD (visible browser)", key="launch_cmd"):
             try:
-                proj_str = str(proj).replace("'", "''")  # Escape for cmd
-                subprocess.Popen(
-                    ["cmd", "/k", f'cd /d "{proj}" && python launch_app_windows.py'],
-                    cwd=str(proj),
-                    creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0,
-                )
-                st.success("Command Prompt opened. Use the app there — the browser will pop up when you click Start.")
+                subprocess.Popen(["cmd", "/k", f'cd /d "{proj}" && python launch_app_windows.py'], cwd=str(proj), creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0)
+                st.success("Command Prompt opened.")
             except Exception as e:
                 st.error(f"Could not open Command Prompt: {e}")
 
-    # ── Live Browser View & Activity Log (fragment = no whole-screen blink) ─
-    if st.session_state.is_running:
+    # ── Live Browser View + Activity Log ────────────────────────────────────
+    st.divider()
+    if is_running:
         _live_automation_fragment()
     else:
         _render_live_panel_content(extracting=False)
@@ -1112,289 +1156,382 @@ def render_extractor_page():
     if st.session_state.pop("_terminal_rerun", False):
         st.rerun()
 
-    # ── Saved sessions for same query (merge / validate / download here) ───
+    # ── Saved sessions for same query set ───────────────────────────────────
     _render_live_query_sessions_panel()
 
-    # ── Saved Files Display ─────────────────────────────────────────────────
-    if st.session_state.saved_files:
-        st.divider()
-        st.markdown("### 💾 Saved Files")
-        for file_info in st.session_state.saved_files:
-            with st.expander(f"📄 {Path(file_info['path']).name} - {file_info['count']} leads ({file_info['timestamp']})"):
-                st.code(file_info['path'], language=None)
-                st.caption(f"Query: {file_info['query']}")
-
-    # ── Results Table ──────────────────────────────────────────────────────
+    # ── Results Table ────────────────────────────────────────────────────────
     if st.session_state.extracted_leads:
         st.divider()
-        st.markdown(f"### 📊 Extracted Leads ({len(st.session_state.extracted_leads)})")
+        leads_list = st.session_state.extracted_leads
+        em = sum(1 for l in leads_list if l.get("email"))
+        ph = sum(1 for l in leads_list if l.get("phone"))
+        nm = sum(1 for l in leads_list if l.get("contact_name"))
 
-        em = sum(1 for l in st.session_state.extracted_leads if l.get("email"))
-        ph = sum(1 for l in st.session_state.extracted_leads if l.get("phone"))
-        nm = sum(1 for l in st.session_state.extracted_leads if l.get("contact_name"))
-
+        st.markdown(f"### 📊 Extracted Leads ({len(leads_list):,})")
         m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total", len(st.session_state.extracted_leads))
+        m1.metric("Total", len(leads_list))
         m2.metric("📧 Emails", em)
         m3.metric("📞 Phones", ph)
         m4.metric("👤 Names", nm)
 
-        df = pd.DataFrame(st.session_state.extracted_leads)
+        df = pd.DataFrame(leads_list)
         if not df.empty:
-            # Column filter: show only selected fields
             preset = st.selectbox("Filter columns", list(COLUMN_PRESETS.keys()), key="live_preset")
-            display_cols = [c for c in COLUMN_PRESETS[preset] if c in df.columns]
-            if not display_cols:
-                display_cols = ["contact_name", "phone", "email"]
-
-            st.dataframe(
-                df[display_cols], use_container_width=True, hide_index=True,
+            display_cols = [c for c in COLUMN_PRESETS[preset] if c in df.columns] or ["contact_name", "phone", "email"]
+            st.dataframe(df[display_cols], use_container_width=True, hide_index=True,
                 column_config={
                     "contact_name": st.column_config.TextColumn("👤 Name", width="medium"),
                     "phone": st.column_config.TextColumn("📞 Phone", width="medium"),
                     "email": st.column_config.TextColumn("📧 Email", width="large"),
                     "business_name": st.column_config.TextColumn("Business", width="medium"),
-                },
-            )
-
-            # Export buttons (use filtered columns for CSV/Excel)
+                })
             st.divider()
             export_cols = COLUMN_PRESETS[preset]
             e1, e2, e3, e4 = st.columns(4)
             with e1:
                 if st.button("📄 CSV", use_container_width=True, key="exp_csv"):
-                    path = export_to_csv(st.session_state.extracted_leads, columns=export_cols)
-                    st.success(f"✅ {path}")
+                    st.success(f"✅ {export_to_csv(leads_list, columns=export_cols)}")
             with e2:
                 if st.button("📊 Excel", use_container_width=True, key="exp_xlsx"):
-                    path = export_to_excel(st.session_state.extracted_leads, columns=export_cols)
-                    st.success(f"✅ {path}")
+                    st.success(f"✅ {export_to_excel(leads_list, columns=export_cols)}")
             with e3:
                 if st.button("📕 PDF", use_container_width=True, key="exp_pdf"):
-                    path = export_to_pdf(st.session_state.extracted_leads, query="Batch Results")
-                    st.success(f"✅ {path}")
+                    st.success(f"✅ {export_to_pdf(leads_list, query='Batch Results')}")
             with e4:
-                csv_data = leads_to_dataframe(st.session_state.extracted_leads, columns=export_cols).to_csv(index=False)
-                st.download_button("⬇️ Download", data=csv_data, file_name="leads.csv", mime="text/csv", use_container_width=True)
+                st.download_button(
+                    "⬇️ Download", use_container_width=True,
+                    data=leads_to_dataframe(leads_list, columns=export_cols).to_csv(index=False),
+                    file_name="leads.csv", mime="text/csv",
+                )
 
 
 # ─── Saved Leads Page ───────────────────────────────────────────────────────
 def render_saved_leads_page():
     st.markdown('<p class="app-title">📋 Saved Leads</p>', unsafe_allow_html=True)
-    
-    from app.database.db import get_recent_searches, get_leads_by_search
-    searches = get_recent_searches(limit=50)
-    
-    if not searches:
-        st.info("No searches found. Run some queries first!")
-        return
-    
-    # Initialize session selection
-    if "saved_leads_selected_ids" not in st.session_state:
-        st.session_state.saved_leads_selected_ids = set()
-    if "saved_leads_column_preset" not in st.session_state:
-        st.session_state.saved_leads_column_preset = "Emails + Names + Phones"
-    
-    st.markdown("### 🔗 Merge & Export Multiple Sessions")
-    st.caption(
-        "Select sessions to merge, filter columns, and download or send to Email Sender. "
-        "**Live runs** (new builds): one **Start** = one saved session — auto query-variations no longer create extra rows."
-    )
-    
-    # Session multi-select
-    sessions_by_date = {}
-    for session in searches:
-        date_str = str(session.get("created_at", ""))[:10] if session.get("created_at") else "Unknown"
-        if date_str not in sessions_by_date:
-            sessions_by_date[date_str] = []
-        sessions_by_date[date_str].append(session)
-    
-    for date_str in sorted(sessions_by_date.keys(), reverse=True):
-        with st.expander(f"📅 {date_str} ({len(sessions_by_date[date_str])} sessions)", expanded=False):
-            for session in sessions_by_date[date_str]:
-                sid = session["id"]
-                query = str(session.get("query", ""))[:50] + ("..." if len(str(session.get("query", ""))) > 50 else "")
-                n = session.get("num_leads", 0)
-                is_sel = st.checkbox(
-                    f"Session #{sid}: {query} ({n} leads)",
-                    value=sid in st.session_state.saved_leads_selected_ids,
-                    key=f"sel_{sid}",
-                )
-                if is_sel:
-                    st.session_state.saved_leads_selected_ids.add(sid)
-                else:
-                    st.session_state.saved_leads_selected_ids.discard(sid)
-    
-    # Quick actions
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        if st.button("✅ Select All", key="saved_select_all"):
-            st.session_state.saved_leads_selected_ids = {s["id"] for s in searches}
-            st.rerun()
-    with c2:
-        if st.button("❌ Clear", key="saved_clear"):
-            st.session_state.saved_leads_selected_ids = set()
-            st.rerun()
-    with c3:
-        if st.button("📅 Today Only", key="saved_today"):
-            today = __import__("datetime").datetime.now().strftime("%Y-%m-%d")
-            st.session_state.saved_leads_selected_ids = {
-                s["id"] for s in searches
-                if str(s.get("created_at", "")).startswith(today)
-            }
-            st.rerun()
-    
-    # Merge, filter, download
-    if st.session_state.saved_leads_selected_ids:
-        all_merged = []
-        for sid in st.session_state.saved_leads_selected_ids:
-            for lead in get_leads_by_search(sid):
-                lead_copy = dict(lead)
-                lead_copy["_session_id"] = sid
-                all_merged.append(lead_copy)
 
-        st.text_area(
-            "Optional: email domain filter before download (one per line)",
-            height=68,
-            key="saved_export_email_domains",
-            help="Examples: `gmail.com`, `*.gov`, `@company.com`. Leave empty to skip.",
-        )
-        # Export mode: Full | Unique (dedup only) | Unique valid (dedup + validation)
-        export_mode = st.radio(
-            "Export mode",
-            [
-                "Full (all leads, no dedup)",
-                "Unique (dedup only, any email with @)",
-                "Unique valid (dedup + strict validation)",
-            ],
-            key="saved_export_mode",
-            help="Full = everything. Unique = dedupe by email. Unique valid = dedupe + format validation.",
-        )
-        use_full = "Full" in export_mode
-        use_validation = "valid" in export_mode.lower()
-        _saved_dom = (st.session_state.get("saved_export_email_domains") or "").strip()
+    tab_extracted, tab_upload = st.tabs(["📥 Extracted Leads", "📤 Upload & Validate External Leads"])
 
-        export_leads, ex_stats = filter_merged_leads_for_export(
-            all_merged,
-            use_full=use_full,
-            use_validation=use_validation,
-            email_domain_allowlist=_saved_dom if _saved_dom else None,
-        )
+    # ════════════════════════════════════════════════════════════════════════════
+    # TAB A — Extracted Leads (existing functionality, unchanged)
+    # ════════════════════════════════════════════════════════════════════════════
+    with tab_extracted:
+        from app.database.db import get_recent_searches, get_leads_by_search
+        searches = get_recent_searches(limit=50)
 
-        if use_full:
-            _doms = ex_stats.get("domain_filtered_count", 0)
-            _fmsg = f"📋 {len(export_leads)} leads (full, no dedup)"
-            if _doms:
-                _fmsg += f" — {_doms} row(s) removed by domain filter"
-            st.info(_fmsg)
+        if not searches:
+            st.info("No searches found. Run some queries first!")
         else:
-            if use_validation:
-                st.success(
-                    f"✅ {len(export_leads)} unique valid leads "
-                    f"(from {ex_stats['merged_raw']} rows → {ex_stats['rows_after_split']} after splitting multi-email cells)"
+            if "saved_leads_selected_ids" not in st.session_state:
+                st.session_state.saved_leads_selected_ids = set()
+            if "saved_leads_column_preset" not in st.session_state:
+                st.session_state.saved_leads_column_preset = "Emails + Names + Phones"
+
+            st.markdown("### 🔗 Merge & Export Multiple Sessions")
+            st.caption(
+                "Select sessions to merge, filter columns, and download. "
+                "One **Start** = one saved session."
+            )
+
+            sessions_by_date: dict = {}
+            for session in searches:
+                date_str = str(session.get("created_at", ""))[:10] if session.get("created_at") else "Unknown"
+                sessions_by_date.setdefault(date_str, []).append(session)
+
+            for date_str in sorted(sessions_by_date.keys(), reverse=True):
+                with st.expander(f"📅 {date_str} ({len(sessions_by_date[date_str])} sessions)", expanded=False):
+                    for session in sessions_by_date[date_str]:
+                        sid = session["id"]
+                        q_label = str(session.get("query", ""))[:50] + ("..." if len(str(session.get("query", ""))) > 50 else "")
+                        n = session.get("num_leads", 0)
+                        is_sel = st.checkbox(
+                            f"Session #{sid}: {q_label} ({n} leads)",
+                            value=sid in st.session_state.saved_leads_selected_ids,
+                            key=f"sel_{sid}",
+                        )
+                        if is_sel:
+                            st.session_state.saved_leads_selected_ids.add(sid)
+                        else:
+                            st.session_state.saved_leads_selected_ids.discard(sid)
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                if st.button("✅ Select All", key="saved_select_all"):
+                    st.session_state.saved_leads_selected_ids = {s["id"] for s in searches}
+                    st.rerun()
+            with c2:
+                if st.button("❌ Clear selection", key="saved_clear"):
+                    st.session_state.saved_leads_selected_ids = set()
+                    st.rerun()
+            with c3:
+                if st.button("📅 Today Only", key="saved_today"):
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    st.session_state.saved_leads_selected_ids = {
+                        s["id"] for s in searches if str(s.get("created_at", "")).startswith(today)
+                    }
+                    st.rerun()
+
+            if st.session_state.saved_leads_selected_ids:
+                all_merged = []
+                for sid in st.session_state.saved_leads_selected_ids:
+                    for lead in get_leads_by_search(sid):
+                        lead_copy = dict(lead)
+                        lead_copy["_session_id"] = sid
+                        all_merged.append(lead_copy)
+
+                st.text_area(
+                    "Optional: email domain filter before download (one per line)",
+                    height=68, key="saved_export_email_domains",
+                    help="Examples: `gmail.com`, `*.gov`, `@company.com`. Leave empty to skip.",
                 )
-            else:
-                st.success(
-                    f"✅ {len(export_leads)} unique leads "
-                    f"(from {ex_stats['merged_raw']} rows → {ex_stats['rows_after_split']} after split, dedup only)"
+                export_mode = st.radio(
+                    "Export mode",
+                    ["Full (all leads, no dedup)", "Unique (dedup only, any email with @)", "Unique valid (dedup + strict validation)"],
+                    key="saved_export_mode",
                 )
-            with st.expander("📊 Breakdown (why leads were excluded)"):
-                if ex_stats["rows_after_split"] != ex_stats["merged_raw"]:
-                    st.markdown(
-                        f"- **Rows after splitting cells:** {ex_stats['rows_after_split']} "
-                        f"(some rows had several addresses in the email field)"
+                use_full = "Full" in export_mode
+                use_validation = "valid" in export_mode.lower()
+                _saved_dom = (st.session_state.get("saved_export_email_domains") or "").strip()
+
+                export_leads, ex_stats = filter_merged_leads_for_export(
+                    all_merged, use_full=use_full, use_validation=use_validation,
+                    email_domain_allowlist=_saved_dom if _saved_dom else None,
+                )
+
+                if use_full:
+                    _doms = ex_stats.get("domain_filtered_count", 0)
+                    _fmsg = f"📋 {len(export_leads)} leads (full, no dedup)"
+                    if _doms:
+                        _fmsg += f" — {_doms} row(s) removed by domain filter"
+                    st.info(_fmsg)
+                else:
+                    label = "unique valid" if use_validation else "unique"
+                    st.success(
+                        f"✅ {len(export_leads)} {label} leads "
+                        f"(from {ex_stats['merged_raw']} rows → {ex_stats['rows_after_split']} after split)"
                     )
-                st.markdown(f"- **No email:** {ex_stats['no_email_count']} (empty/missing after split)")
-                if use_validation:
-                    st.markdown(f"- **Invalid format:** {ex_stats['invalid_count']} (failed email validation)")
-                st.markdown(f"- **Duplicate:** {ex_stats['dup_count']} (same email already seen)")
-                if ex_stats.get("domain_filtered_count", 0):
-                    st.markdown(f"- **Domain filter (export):** {ex_stats['domain_filtered_count']}")
-                st.caption("Try **Full** to export everything, or **Unique (dedup only)** if validation drops too many.")
+                    with st.expander("📊 Breakdown"):
+                        st.markdown(f"- **No email:** {ex_stats['no_email_count']}")
+                        if use_validation:
+                            st.markdown(f"- **Invalid format:** {ex_stats['invalid_count']}")
+                        st.markdown(f"- **Duplicate:** {ex_stats['dup_count']}")
+                        if ex_stats.get("domain_filtered_count", 0):
+                            st.markdown(f"- **Domain filter:** {ex_stats['domain_filtered_count']}")
 
-        # Column filter
-        preset = st.selectbox(
-            "Filter columns to show/export",
-            list(COLUMN_PRESETS.keys()),
-            key="saved_preset",
+                preset = st.selectbox("Filter columns", list(COLUMN_PRESETS.keys()), key="saved_preset")
+                st.session_state.saved_leads_column_preset = preset
+                cols = [c for c in COLUMN_PRESETS[preset] if c in (export_leads[0].keys() if export_leads else [])] or list(COLUMN_PRESETS[preset])
+                df_merged = pd.DataFrame(export_leads)
+                show_cols = [c for c in cols if c in df_merged.columns]
+                if not df_merged.empty:
+                    st.dataframe(df_merged[show_cols] if show_cols else df_merged, use_container_width=True, hide_index=True)
+
+                st.markdown("**Download merged:**")
+                e1, e2, e3 = st.columns(3)
+                with e1:
+                    st.download_button(
+                        "⬇️ CSV", key="dl_merged_csv", mime="text/csv",
+                        data=leads_to_dataframe(export_leads, columns=COLUMN_PRESETS[preset]).to_csv(index=False),
+                        file_name="merged_leads.csv",
+                    )
+                with e2:
+                    if st.button("📄 Save CSV", key="save_merged_csv"):
+                        st.success(f"✅ {export_to_csv(export_leads, f'merged_{len(export_leads)}_leads.csv', columns=COLUMN_PRESETS[preset])}")
+                with e3:
+                    if st.button("📊 Save Excel", key="save_merged_xlsx"):
+                        st.success(f"✅ {export_to_excel(export_leads, f'merged_{len(export_leads)}_leads.xlsx', columns=COLUMN_PRESETS[preset])}")
+
+            st.divider()
+            st.markdown("### 🔍 Individual Sessions")
+            single_preset = st.selectbox("Export columns (per session)", list(COLUMN_PRESETS.keys()), key="single_preset")
+            single_cols = COLUMN_PRESETS[single_preset]
+            for search in searches:
+                search_id = search["id"]
+                query = search["query"]
+                num_leads = search["num_leads"]
+                created_at = search["created_at"]
+                with st.expander(f"Session #{search_id}: {query[:60]}{'...' if len(query) > 60 else ''} ({num_leads} leads) — {created_at}"):
+                    leads = get_leads_by_search(search_id)
+                    if leads:
+                        df = pd.DataFrame(leads)
+                        avail = [c for c in ["contact_name", "phone", "email"] if c in df.columns]
+                        st.dataframe(df[avail], use_container_width=True, hide_index=True,
+                            column_config={
+                                "contact_name": st.column_config.TextColumn("👤 Name", width="medium"),
+                                "phone": st.column_config.TextColumn("📞 Phone", width="medium"),
+                                "email": st.column_config.TextColumn("📧 Email", width="large"),
+                            })
+                        col1, col2, col3 = st.columns(3)
+                        with col1:
+                            st.download_button("⬇️ CSV", key=f"dl_{search_id}", mime="text/csv",
+                                data=leads_to_dataframe(leads, columns=single_cols).to_csv(index=False),
+                                file_name=f"session_{search_id}.csv")
+                        with col2:
+                            if st.button("📄 Save CSV", key=f"csv_{search_id}"):
+                                st.success(f"✅ {export_to_csv(leads, f'session_{search_id}', columns=single_cols)}")
+                        with col3:
+                            if st.button("📊 Save Excel", key=f"xlsx_{search_id}"):
+                                st.success(f"✅ {export_to_excel(leads, f'session_{search_id}', columns=single_cols)}")
+                    else:
+                        st.caption("No leads found for this session.")
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # TAB B — Upload & Validate External Leads
+    # ════════════════════════════════════════════════════════════════════════════
+    with tab_upload:
+        st.markdown("### 📤 Upload Personal Leads")
+        st.caption("Import your own lead list from any file. Supports `.txt` (one email per line), `.csv`, `.xlsx`, `.json`.")
+
+        # ── Upload widget ────────────────────────────────────────────────────
+        uploaded_file = st.file_uploader(
+            "Choose a file",
+            type=["txt", "csv", "xlsx", "json", "xls", "tsv"],
+            help="TXT: one email per line · CSV/XLSX: auto-detects email column · JSON: array or object with leads key",
         )
-        st.session_state.saved_leads_column_preset = preset
-        cols = [c for c in COLUMN_PRESETS[preset] if c in (export_leads[0].keys() if export_leads else [])]
-        if not cols:
-            cols = list(COLUMN_PRESETS[preset])
 
-        # Preview
-        df_merged = pd.DataFrame(export_leads)
-        show_cols = [c for c in cols if c in df_merged.columns]
-        display_df = df_merged[show_cols] if show_cols else df_merged
-        if not display_df.empty:
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+        if uploaded_file:
+            file_bytes = uploaded_file.read()
+            file_name = uploaded_file.name
+            st.info(f"📄 {file_name} — {len(file_bytes):,} bytes")
 
-        # Export merged
-        st.markdown("**Download merged (filtered columns):**")
-        e1, e2, e3, e4 = st.columns(4)
-        with e1:
-            csv_data = leads_to_dataframe(export_leads, columns=COLUMN_PRESETS[preset]).to_csv(index=False)
-            st.download_button("⬇️ CSV", data=csv_data, file_name="merged_leads.csv", mime="text/csv", key="dl_merged_csv")
-        with e2:
-            if st.button("📄 Save CSV", key="save_merged_csv"):
-                path = export_to_csv(export_leads, f"merged_{len(export_leads)}_leads.csv", columns=COLUMN_PRESETS[preset])
-                st.success(f"✅ {path}")
-        with e3:
-            if st.button("📊 Save Excel", key="save_merged_xlsx"):
-                path = export_to_excel(export_leads, f"merged_{len(export_leads)}_leads.xlsx", columns=COLUMN_PRESETS[preset])
-                st.success(f"✅ {path}")
-        with e4:
-            if st.button("📧 Use for Email Campaign", key="use_merged_email"):
-                st.session_state.merged_leads_for_email = export_leads
-                st.session_state.selected_session_ids = list(st.session_state.saved_leads_selected_ids)
-                st.session_state.current_page = "📧 Email Sender"
-                st.session_state.top_nav_radio = "📧 Email Sender"
-                st.rerun()
-    
-    st.divider()
-    st.markdown("### 🔍 Individual Sessions")
-    st.caption("View and export each session separately. Use the column filter below for exports.")
-    
-    single_preset = st.selectbox("Export columns (per session)", list(COLUMN_PRESETS.keys()), key="single_preset")
-    single_cols = COLUMN_PRESETS[single_preset]
-    
-    for search in searches:
-        search_id = search["id"]
-        query = search["query"]
-        num_leads = search["num_leads"]
-        created_at = search["created_at"]
-        
-        with st.expander(f"Session #{search_id}: {query[:60]}{'...' if len(query) > 60 else ''} ({num_leads} leads) - {created_at}"):
-            leads = get_leads_by_search(search_id)
-            if leads:
-                df = pd.DataFrame(leads)
-                display_cols = ["contact_name", "phone", "email"]
-                avail = [c for c in display_cols if c in df.columns]
-                
-                st.dataframe(
-                    df[avail], use_container_width=True, hide_index=True,
-                    column_config={
-                        "contact_name": st.column_config.TextColumn("👤 Name", width="medium"),
-                        "phone": st.column_config.TextColumn("📞 Phone", width="medium"),
-                        "email": st.column_config.TextColumn("📧 Email", width="large"),
-                    },
+            # Preview
+            if st.checkbox("Preview file content", value=True, key="ul_preview_toggle"):
+                try:
+                    if file_name.lower().endswith((".txt", ".tsv", ".csv", ".json")):
+                        preview_text = file_bytes.decode("utf-8", errors="ignore")
+                        lines = preview_text.splitlines()[:12]
+                        st.code("\n".join(lines), language="text")
+                    else:
+                        st.caption("Binary file — preview not available")
+                except Exception as ex:
+                    st.caption(f"Preview error: {ex}")
+
+            if st.button("⬆️ Import leads", type="primary", key="ul_import_btn"):
+                with st.spinner("Parsing and importing…"):
+                    try:
+                        leads_parsed, parse_msgs = upload_leads_from_file(file_bytes, file_name)
+                        if not leads_parsed:
+                            st.warning("No leads found in file. Check the format and try again.")
+                            for m in parse_msgs:
+                                st.caption(m)
+                        else:
+                            saved_count, save_msgs = save_external_leads(leads_parsed, source="manual_upload", file_name=file_name)
+                            st.success(f"✅ {saved_count} leads imported from {file_name}")
+                            for m in (parse_msgs + save_msgs):
+                                if m:
+                                    st.caption(m)
+                            st.session_state.ext_leads_last_imported = saved_count
+                    except Exception as ex:
+                        st.error(f"Import failed: {ex}")
+
+        st.divider()
+
+        # ── Domain Stats ─────────────────────────────────────────────────────
+        st.markdown("### 📊 Domain Breakdown")
+        try:
+            domain_stats = get_domain_statistics()
+        except Exception:
+            domain_stats = {}
+
+        if domain_stats:
+            df_domains = pd.DataFrame(
+                [{"Domain": d, "Count": c} for d, c in list(domain_stats.items())[:30]],
+            )
+            st.dataframe(df_domains, use_container_width=True, hide_index=True,
+                column_config={
+                    "Domain": st.column_config.TextColumn("📧 Domain", width="large"),
+                    "Count": st.column_config.NumberColumn("Leads", width="small"),
+                })
+            total_ext = sum(domain_stats.values())
+            st.caption(f"Total external leads stored: **{total_ext:,}** across {len(domain_stats)} domain(s)")
+        else:
+            st.info("No external leads imported yet. Upload a file above.")
+
+        st.divider()
+
+        # ── Filter + View ─────────────────────────────────────────────────────
+        st.markdown("### 🔍 Filter & Validate")
+
+        domain_filter_input = st.text_input(
+            "Filter by domain (e.g. gmail.com or comcast.net)", key="ul_domain_filter",
+            placeholder="Leave empty to show all",
+        )
+
+        try:
+            ext_leads = get_external_leads(limit=5000, domain_filter=domain_filter_input.strip() or None)
+        except Exception:
+            ext_leads = []
+
+        if ext_leads:
+            st.caption(f"Showing {len(ext_leads):,} lead(s)" + (f" matching `{domain_filter_input}`" if domain_filter_input else ""))
+
+            # Validate button
+            if st.button("✅ Validate emails", key="ul_validate_btn"):
+                valid_n = invalid_n = 0
+                invalid_list = []
+                for lead in ext_leads:
+                    email = lead.get("email", "")
+                    if email:
+                        result = validate_email(email)
+                        if result.is_valid:
+                            valid_n += 1
+                        else:
+                            invalid_n += 1
+                            invalid_list.append(f"{email} — {result.error_message}")
+                st.success(f"✅ Valid: {valid_n}")
+                if invalid_n:
+                    st.warning(f"❌ Invalid: {invalid_n}")
+                    with st.expander(f"Show {invalid_n} invalid email(s)"):
+                        st.code("\n".join(invalid_list[:100]))
+
+            # Display table
+            df_ext = pd.DataFrame(ext_leads)
+            show_ext_cols = [c for c in ["email", "domain", "contact_name", "business_name", "phone", "source"] if c in df_ext.columns]
+            st.dataframe(df_ext[show_ext_cols] if show_ext_cols else df_ext, use_container_width=True, hide_index=True,
+                column_config={
+                    "email": st.column_config.TextColumn("📧 Email", width="large"),
+                    "domain": st.column_config.TextColumn("Domain", width="medium"),
+                    "contact_name": st.column_config.TextColumn("Name", width="medium"),
+                })
+
+            # Export
+            st.markdown("**Export filtered leads:**")
+            ex1, ex2 = st.columns(2)
+            with ex1:
+                st.download_button(
+                    "⬇️ Download CSV", key="ul_dl_csv", mime="text/csv",
+                    data=pd.DataFrame(ext_leads).to_csv(index=False),
+                    file_name=f"external_leads{'_' + domain_filter_input if domain_filter_input else ''}.csv",
                 )
-                
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    csv_one = leads_to_dataframe(leads, columns=single_cols).to_csv(index=False)
-                    st.download_button("⬇️ Download CSV", data=csv_one, file_name=f"session_{search_id}.csv", mime="text/csv", key=f"dl_{search_id}")
-                with col2:
-                    if st.button(f"📄 Save CSV", key=f"csv_{search_id}"):
-                        path = export_to_csv(leads, f"session_{search_id}", columns=single_cols)
-                        st.success(f"✅ {path}")
-                with col3:
-                    if st.button(f"📊 Save Excel", key=f"xlsx_{search_id}"):
-                        path = export_to_excel(leads, f"session_{search_id}", columns=single_cols)
-                        st.success(f"✅ {path}")
-            else:
-                st.caption("No leads found for this session.")
+            with ex2:
+                # Duplicate check vs extracted leads
+                if st.button("🔗 Check duplicates vs extracted", key="ul_dup_check"):
+                    dupes = []
+                    for lead in ext_leads[:2000]:
+                        email = lead.get("email", "")
+                        if email:
+                            match = compare_with_extracted_leads(email)
+                            if match and match.get("found"):
+                                dupes.append(f"{email} → found in session #{match.get('lead_id')}")
+                    if dupes:
+                        st.warning(f"Found {len(dupes)} duplicate(s) in your extracted leads DB:")
+                        with st.expander("Show duplicates"):
+                            st.code("\n".join(dupes[:100]))
+                    else:
+                        st.success("No duplicates found — these leads are unique vs your extracted leads.")
+
+            # Clear all external leads
+            st.divider()
+            if st.button("🗑️ Clear all external leads", key="ul_clear_all", type="secondary"):
+                try:
+                    ids = [l["id"] for l in ext_leads if l.get("id")]
+                    if ids:
+                        deleted, msg = delete_external_leads(ids)
+                        st.success(f"Deleted {deleted} external lead(s). {msg}")
+                        st.rerun()
+                except Exception as ex:
+                    st.error(f"Delete failed: {ex}")
+        else:
+            st.info("No external leads match your filter. Import leads above or change the domain filter.")
 
 
 # ─── Settings Page ────────────────────────────────────────────────────────────
@@ -1485,8 +1622,6 @@ def main():
         render_extractor_page()
     elif current_page == "📋 Saved Leads":
         render_saved_leads_page()
-    elif current_page == "📧 Email Sender":
-        render_email_sender_page()
     elif current_page == "⚙️ Settings":
         render_settings_page()
 

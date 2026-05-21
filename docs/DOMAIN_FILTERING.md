@@ -24,6 +24,14 @@ Lines starting with `#` are comments.
 - **`*.edu` is not used** for `site:` (not valid in search operators). Use concrete sites, or rely on the email allowlist for “any .edu address”.
 - Overly narrow `site:` + niche keywords may return **zero** results — relax keywords or remove some sites.
 
+### Search / social portals (auto-skipped)
+
+Putting **`google.com`**, **`facebook.com`**, **`bing.com`**, **`duckduckgo.com`**, etc. in “Restrict search to websites” is almost always wrong: the `site:` operator limits results to **pages hosted on that domain**, not “use Google to search.” That often yields **no PDF hits**. The app **drops** known portal domains from the `site:` clause and logs why; leave the box empty for a normal broad search, or list real document hosts (`.gov`, a company’s public file server, a university site).
+
+### Reddit (`site:reddit.com` / `redd.it`)
+
+Reddit threads are **HTML**, not PDFs. The default DuckDuckGo path adds **`filetype:pdf`** and only followed **`.pdf`** links, so **`site:reddit.com` looked like “no results.”** When **every** site you list is Reddit-only (e.g. just `reddit.com` or `redd.it`), the app **does not** add `filetype:pdf`, follows Reddit result URLs, and extracts emails/phones/names from the **page text** (best effort; Reddit may block some automated fetches). If you mix Reddit with a PDF host (e.g. `reddit.com` + `state.gov`), the run stays in **PDF mode** for all queries.
+
 ## Implementation
 
 - Rules parser & matching: `app/filters/email_domain_rules.py`

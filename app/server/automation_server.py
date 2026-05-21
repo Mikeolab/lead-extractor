@@ -14,7 +14,8 @@ import sys
 import subprocess
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Literal
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, Page, Browser
@@ -55,6 +56,65 @@ def is_rdp_session() -> bool:
     return False
 
 
+def _strip_trailing_filetype_pdf(raw: str) -> str:
+    """Strip trailing filetype:pdf from queued strings so site: is not re-wrapped each variation."""
+    t = (raw or "").strip()
+    low = t.lower()
+    for suf in (" filetype:pdf", " filetype: pdf"):
+        if low.endswith(suf):
+            return t[: -len(suf)].strip()
+    return t
+
+
+# DuckDuckGo HTML search rejects very long queries; nested (site:) bugs used to exceed this fast.
+MAX_DDG_QUERY_CHARS = 420
+
+_HTML_FETCH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _url_is_reddit_thread_like(href: str) -> bool:
+    """Rough filter: Reddit post / short link, not the homepage."""
+    if not href or not href.strip():
+        return False
+    try:
+        h = href.strip()
+        if h.startswith("//"):
+            u = urlparse("https:" + h)
+        elif h.startswith("http"):
+            u = urlparse(h)
+        else:
+            u = urlparse("https://" + h.lstrip("/"))
+        host = (u.netloc or "").lower()
+        path = (u.path or "").lower()
+        if host == "redd.it" or host.endswith(".redd.it"):
+            return len(path) > 1
+        if host == "reddit.com" or host.endswith(".reddit.com"):
+            if "/comments/" in path:
+                return True
+            if path.startswith("/r/") and len(path) > 4:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _classify_ddg_serp_href(href: str, html_first_mode: bool) -> Optional[Literal["pdf", "html"]]:
+    """How to handle a DuckDuckGo result URL. None = skip."""
+    path_lower = (href.split("?")[0] if "?" in href else href).lower()
+    if path_lower.endswith(".pdf"):
+        return "pdf"
+    if html_first_mode and _url_is_reddit_thread_like(href):
+        return "html"
+    return None
+
+
 # Package root on path, then pdfplumber + extractors
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -71,9 +131,10 @@ from app.extractors.phone_extractor import extract_phones
 from app.database.db import save_search, save_leads
 from app.filters.email_domain_rules import (
     apply_site_restriction_to_query,
-    build_site_restriction_clause,
     filter_leads_by_email_domains,
     parse_email_domain_allowlist,
+    prepare_site_restriction_for_automation,
+    site_restriction_targets_only_pdf_rare_hosts,
 )
 
 app = FastAPI()
@@ -386,6 +447,113 @@ class AutomationManager:
 
         return leads
 
+    async def extract_from_html(self, page_url: str, title: str, display_link: str) -> List[Dict]:
+        """Download HTML (e.g. Reddit thread), visible text, same lead fields as PDF path."""
+        leads: List[Dict] = []
+        try:
+            await self.broadcast({
+                "type": "status",
+                "message": f"  📥 Fetching page: {title[:50]}...",
+            })
+            html_text = ""
+            try:
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                    response = await client.get(page_url, headers=_HTML_FETCH_HEADERS)
+                    if response.status_code != 200:
+                        await self.broadcast({
+                            "type": "status",
+                            "message": f"  ❌ Page HTTP {response.status_code}",
+                        })
+                        return leads
+                    raw = response.text or ""
+                    soup = BeautifulSoup(raw, "lxml")
+                    for tag in soup(["script", "style", "noscript"]):
+                        tag.decompose()
+                    html_text = soup.get_text(separator="\n", strip=True)
+            except httpx.TimeoutException:
+                await self.broadcast({"type": "status", "message": "  ❌ Page download timeout"})
+                return leads
+            except Exception as e:
+                await self.broadcast({
+                    "type": "status",
+                    "message": f"  ❌ Page fetch error: {str(e)[:50]}",
+                })
+                return leads
+
+            if not html_text or len(html_text.strip()) < 10:
+                await self.broadcast({
+                    "type": "status",
+                    "message": "  ⚠️ No usable text on page (blocked, login wall, or empty)",
+                })
+                return leads
+
+            await self.broadcast({
+                "type": "status",
+                "message": f"  ✅ Extracted {len(html_text)} chars from page",
+            })
+            await self.broadcast({
+                "type": "status",
+                "message": "  🔍 Searching for emails, phones, names...",
+            })
+
+            emails = extract_emails(html_text, "")
+            phones = extract_phones(html_text, "")
+            names = extract_contact_names(html_text)
+
+            await self.broadcast({
+                "type": "status",
+                "message": f"  📊 Found: {len(emails)} emails, {len(phones)} phones, {len(names)} names",
+            })
+
+            if emails and not names:
+                for email in emails:
+                    derived = extract_names_from_email(email)
+                    if derived:
+                        names.append(derived)
+
+            if emails:
+                for j, email in enumerate(emails):
+                    cn = names[j] if j < len(names) else (names[0] if names else "")
+                    ph = phones[j] if j < len(phones) else (phones[0] if phones else "")
+                    leads.append({
+                        "email": email,
+                        "phone": ph,
+                        "contact_name": cn,
+                        "business_name": "",
+                        "website": "",
+                        "source_url": page_url,
+                        "snippet": "",
+                    })
+                await self.broadcast({
+                    "type": "status",
+                    "message": f"  ✅ Created {len(leads)} lead(s) from page",
+                })
+            elif phones or names:
+                leads.append({
+                    "email": "",
+                    "phone": phones[0] if phones else "",
+                    "contact_name": names[0] if names else "",
+                    "business_name": "",
+                    "website": "",
+                    "source_url": page_url,
+                    "snippet": "",
+                })
+                await self.broadcast({
+                    "type": "status",
+                    "message": "  ✅ Created 1 lead (phone/name only) from page",
+                })
+            else:
+                await self.broadcast({
+                    "type": "status",
+                    "message": "  ⚠️ No emails/phones/names in page text",
+                })
+        except Exception as e:
+            await self.broadcast({
+                "type": "status",
+                "message": f"  ❌ HTML extraction error: {str(e)[:60]}",
+            })
+        return leads
+
     async def run_automation(
         self,
         queries: List[str],
@@ -569,7 +737,32 @@ class AutomationManager:
             self.all_leads_buffer = []  # Reset buffer
 
             email_rules = parse_email_domain_allowlist(email_domain_allowlist)
-            site_clause = build_site_restriction_clause(search_site_domains)
+            site_clause, site_skipped_portals, site_accepted_domains = (
+                prepare_site_restriction_for_automation(search_site_domains)
+            )
+            ddg_html_first_mode = (
+                search_engine == "duckduckgo"
+                and site_restriction_targets_only_pdf_rare_hosts(site_accepted_domains)
+            )
+            if ddg_html_first_mode:
+                await self.broadcast({
+                    "type": "status",
+                    "message": (
+                        "📌 **Reddit / thread mode:** site list is PDF-rare only (e.g. `reddit.com`). "
+                        "Skipping automatic `filetype:pdf` and parsing **HTML** result links. "
+                        "Mixed site lists (e.g. Reddit + `.gov`) still use PDF mode for all hosts."
+                    ),
+                })
+            if site_skipped_portals:
+                await self.broadcast({
+                    "type": "status",
+                    "message": (
+                        "ℹ️ **Not using site:** for "
+                        + ", ".join(f"`{d}`" for d in site_skipped_portals)
+                        + " — that would only show pages **hosted on** those sites, not “search with Google/Facebook”. "
+                        "Leave this box empty for a normal web search, or list real PDF hosts (e.g. `state.gov`, a university domain)."
+                    ),
+                })
             if site_clause:
                 await self.broadcast({
                     "type": "status",
@@ -598,6 +791,10 @@ class AutomationManager:
                 " leadership", " team", " contacts page",
                 " site:org", " filetype:pdf intext:email",
             ]
+            if ddg_html_first_mode:
+                DDG_QUERY_VARIATIONS = [
+                    v for v in DDG_QUERY_VARIATIONS if "filetype:" not in v.lower()
+                ]
             query_queue = list(queries)
             initial_queries_frozen = frozenset((q or "").strip() for q in queries if (q or "").strip())
             variation_idx = 0
@@ -646,10 +843,13 @@ class AutomationManager:
             """
 
             while query_queue and not self.stop_flag:
-                query = query_queue.pop(0)
-                effective_query = apply_site_restriction_to_query(query, site_clause)
+                query = (query_queue.pop(0) or "").strip()
+                # Apply site: only to keyword part — queue must never contain a pre-wrapped "(...) site:" string
+                # or each auto-variation would wrap again (broken parens + DDG "query too long").
+                query_keywords = _strip_trailing_filetype_pdf(query)
+                effective_query = apply_site_restriction_to_query(query_keywords, site_clause)
                 query_idx += 1
-                if (query or "").strip() in initial_queries_frozen:
+                if query in initial_queries_frozen:
                     variation_idx = 0
                 if self.stop_flag:
                     await self.broadcast({"type": "status", "message": "🛑 Stopped by user"})
@@ -724,6 +924,12 @@ class AutomationManager:
                     total_queued = query_idx + len(query_queue)
                     q_preview = effective_query if len(effective_query) <= 72 else effective_query[:69] + "..."
                     await self.broadcast({
+                        "type": "query_progress",
+                        "current": query_idx,
+                        "total": total_queued,
+                        "current_query": effective_query[:80],
+                    })
+                    await self.broadcast({
                         "type": "status",
                         "message": f"--- Query {query_idx} (total in queue: {total_queued}): \"{q_preview}\" ---",
                     })
@@ -740,11 +946,22 @@ class AutomationManager:
 
                     # ─── DuckDuckGo flow (no CAPTCHA) ─────────────────────────────────────────
                     if search_engine == "duckduckgo":
-                        # Add filetype:pdf if not present - dramatically improves PDF results
+                        # PDF runs: filetype:pdf improves hits. Reddit-only site: forces empty SERPs + we need HTML URLs.
                         q = effective_query.strip()
-                        if "filetype:pdf" not in q.lower() and "filetype: pdf" not in q.lower():
-                            q = f"{q} filetype:pdf"
+                        if not ddg_html_first_mode:
+                            if "filetype:pdf" not in q.lower() and "filetype: pdf" not in q.lower():
+                                q = f"{q} filetype:pdf"
+                        if len(q) > MAX_DDG_QUERY_CHARS:
+                            await self.broadcast({
+                                "type": "status",
+                                "message": (
+                                    f"⚠️ Query was {len(q)} chars; DuckDuckGo rejects very long strings. "
+                                    f"Truncating to {MAX_DDG_QUERY_CHARS} chars — narrow keywords or fewer site: domains."
+                                ),
+                            })
+                            q = q[:MAX_DDG_QUERY_CHARS].strip()
                         ddg_url = f"https://html.duckduckgo.com/html/?q={quote_plus(q)}"
+                        ddg_q_sent = q  # what we actually searched (for lead metadata)
                         await self.broadcast({"type": "status", "message": f"🌐 [DuckDuckGo] Opening... (no CAPTCHA)"})
                         await self.broadcast({"type": "status", "message": f"  🔍 Query: {q[:60]}..."})
                         processed_urls = set()
@@ -823,19 +1040,25 @@ class AutomationManager:
                                                         href = unquote(qs["uddg"][0])
                                                 except Exception:
                                                     pass
-                                            # Accept .pdf or .pdf?params
-                                            path_lower = (href.split("?")[0] if "?" in href else href).lower()
-                                            if href in processed_urls or not path_lower.endswith(".pdf"):
+                                            kind = _classify_ddg_serp_href(href, ddg_html_first_mode)
+                                            if href in processed_urls or kind is None:
                                                 continue
                                             processed_urls.add(href)
                                             pdf_count += 1
                                             display_link = urlparse(href).netloc if href.startswith("http") else ""
-                                            await self.broadcast({"type": "status", "message": f"  📄 [{pdf_count}] {title[:50]}..."})
+                                            label = "PDF" if kind == "pdf" else "page"
+                                            await self.broadcast({
+                                                "type": "status",
+                                                "message": f"  📄 [{pdf_count}] ({label}) {title[:50]}...",
+                                            })
                                             if pdf_count % 10 == 0:  # Screenshot every 10 PDFs for Live Browser View
                                                 ss = await self.take_screenshot()
                                                 if ss:
                                                     await self.broadcast({"type": "screenshot", "data": ss})
-                                            pdf_leads = await self.extract_from_pdf(href, title, display_link)
+                                            if kind == "pdf":
+                                                pdf_leads = await self.extract_from_pdf(href, title, display_link)
+                                            else:
+                                                pdf_leads = await self.extract_from_html(href, title, display_link)
                                             if pdf_leads:
                                                 filtered_pdf, dom_drop = filter_leads_by_email_domains(
                                                     pdf_leads, email_rules
@@ -848,7 +1071,7 @@ class AutomationManager:
                                                 if not filtered_pdf:
                                                     continue
                                                 for lead in filtered_pdf:
-                                                    lead["search_query"] = effective_query
+                                                    lead["search_query"] = ddg_q_sent
                                                 query_leads.extend(filtered_pdf)
                                                 total_leads_extracted += len(filtered_pdf)
                                                 await self.broadcast({"type": "lead_count", "count": total_leads_extracted, "target": target_leads})
@@ -918,10 +1141,12 @@ class AutomationManager:
                                 or (ddg_flow_error and len(query_leads) == 0)
                             )
                         ):
-                            base = q.replace(" filetype:pdf", "").replace(" filetype: pdf", "").strip()
+                            base = _strip_trailing_filetype_pdf(query)
                             suffix = DDG_QUERY_VARIATIONS[variation_idx].strip()
                             variation_idx += 1
                             if "filetype:" in suffix.lower():
+                                new_q = (base + " " + suffix).replace("  ", " ").strip()
+                            elif ddg_html_first_mode:
                                 new_q = (base + " " + suffix).replace("  ", " ").strip()
                             else:
                                 new_q = (base + " " + suffix + " filetype:pdf").replace("  ", " ").strip()

@@ -19,6 +19,9 @@ build/
 dist/
 *.app
 
+# Playwright browsers (installed locally or by CI — never committed, can be 300 MB+)
+playwright_browsers/
+
 # Data & exports (local)
 data/
 exports/

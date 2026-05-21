@@ -60,85 +60,31 @@ def get_connection():
         CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email);
         CREATE INDEX IF NOT EXISTS idx_searches_created_at ON searches(created_at);
 
-        -- Email module tables
-        CREATE TABLE IF NOT EXISTS mailboxes (
+        -- External leads table for user-uploaded leads
+        CREATE TABLE IF NOT EXISTS external_leads (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            provider TEXT NOT NULL,
-            smtp_host TEXT NOT NULL,
-            smtp_port INTEGER NOT NULL,
-            smtp_username TEXT NOT NULL,
-            smtp_password_encrypted TEXT NOT NULL,
-            api_key_encrypted TEXT,
-            daily_limit INTEGER DEFAULT 500,
-            sent_today INTEGER DEFAULT 0,
-            sent_total INTEGER DEFAULT 0,
-            is_active BOOLEAN DEFAULT 1,
-            last_used TIMESTAMP,
-            last_error TEXT,
-            error_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            smtp_encryption TEXT DEFAULT 'auto'
+            business_name TEXT DEFAULT '',
+            contact_name TEXT DEFAULT '',
+            email TEXT DEFAULT '',
+            phone TEXT DEFAULT '',
+            website TEXT DEFAULT '',
+            domain TEXT DEFAULT '',
+            source TEXT DEFAULT 'manual_upload',
+            file_name TEXT,
+            upload_batch_id TEXT,
+            is_validated BOOLEAN DEFAULT 0,
+            validation_status TEXT DEFAULT 'pending',
+            duplicate_of_search_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
 
-        CREATE TABLE IF NOT EXISTS email_campaigns (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            subject_template TEXT NOT NULL,
-            body_template TEXT NOT NULL,
-            status TEXT DEFAULT 'draft',
-            total_recipients INTEGER DEFAULT 0,
-            sent_count INTEGER DEFAULT 0,
-            failed_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            started_at TIMESTAMP,
-            completed_at TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS email_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            campaign_id INTEGER,
-            mailbox_id INTEGER,
-            recipient_email TEXT NOT NULL,
-            recipient_name TEXT,
-            subject TEXT NOT NULL,
-            body TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            priority INTEGER DEFAULT 0,
-            attempts INTEGER DEFAULT 0,
-            max_attempts INTEGER DEFAULT 3,
-            error_message TEXT,
-            scheduled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            processed_at TIMESTAMP,
-            sent_at TIMESTAMP,
-            FOREIGN KEY (campaign_id) REFERENCES email_campaigns(id),
-            FOREIGN KEY (mailbox_id) REFERENCES mailboxes(id)
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_mailboxes_active ON mailboxes(is_active, sent_today);
-        CREATE INDEX IF NOT EXISTS idx_queue_status ON email_queue(status, priority DESC, scheduled_at);
-        CREATE INDEX IF NOT EXISTS idx_queue_mailbox ON email_queue(mailbox_id, status);
-        CREATE INDEX IF NOT EXISTS idx_queue_campaign ON email_queue(campaign_id, status);
+        CREATE INDEX IF NOT EXISTS idx_external_leads_email ON external_leads(email);
+        CREATE INDEX IF NOT EXISTS idx_external_leads_domain ON external_leads(domain);
+        CREATE INDEX IF NOT EXISTS idx_external_leads_batch ON external_leads(upload_batch_id);
     """)
 
-    _migrate_sqlite_mailboxes_smtp_encryption(conn)
     conn.commit()
     return conn
-
-
-def _migrate_sqlite_mailboxes_smtp_encryption(conn: sqlite3.Connection) -> None:
-    """Add smtp_encryption to mailboxes if missing (older DBs)."""
-    try:
-        cur = conn.execute("PRAGMA table_info(mailboxes)")
-        cols = {row[1] for row in cur.fetchall()}
-    except sqlite3.Error:
-        return
-    if not cols or "smtp_encryption" in cols:
-        return
-    conn.execute(
-        "ALTER TABLE mailboxes ADD COLUMN smtp_encryption TEXT DEFAULT 'auto'"
-    )
 
 
 def save_search(query: str, num_results: int = 0) -> int:

@@ -73,7 +73,14 @@ hiddenimports = [
     'undetected_chromedriver',
     'dotenv',
     'socketio',
-    'pywebview',
+    # PyWebview is published as 'pywebview' on PyPI but imports as 'webview'.
+    # We need the import name plus the Windows backends so the frozen exe can
+    # find WebView2/EdgeChromium at runtime.
+    'webview',
+    'webview.platforms',
+    'webview.platforms.edgechromium',
+    'webview.platforms.winforms',
+    'webview.util',
 ]
 
 def _toc_to_src_dest(toc_list):
@@ -113,6 +120,18 @@ tmp_ret = collect_all('cryptography')
 datas += _toc_to_src_dest(tmp_ret[0])
 binaries += _toc_to_src_dest(tmp_ret[1])
 hiddenimports += tmp_ret[2]
+
+# PyWebview ships HTML/JS bridge assets and platform backends that PyInstaller
+# does not pick up unless we collect_all the package. Wrap in try/except so a
+# missing optional backend doesn't break the build on machines that don't have
+# every webview dependency installed.
+try:
+    tmp_ret = collect_all('webview')
+    datas += _toc_to_src_dest(tmp_ret[0])
+    binaries += _toc_to_src_dest(tmp_ret[1])
+    hiddenimports += tmp_ret[2]
+except Exception as _e:
+    print(f"[spec] WARNING: collect_all('webview') failed: {_e}")
 
 a = Analysis(
     ['launch_app_windows.py'],
