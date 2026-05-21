@@ -1,9 +1,12 @@
 """Email and lead validation module."""
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Set
 import re
 from email_validator import validate_email as email_validate, EmailNotValidError
+
+# DNS MX cache: domain → bool (has valid MX records)
+_mx_cache: dict = {}
 
 
 @dataclass
@@ -15,39 +18,61 @@ class ValidationResult:
     domain: Optional[str] = None
 
 
-def validate_email(email: str) -> ValidationResult:
+def _check_mx(domain: str) -> tuple[bool, str]:
+    """
+    Check whether `domain` has MX records (DNS lookup).
+    Results are cached per process so repeated same-domain lookups are instant.
+    Returns (ok, error_msg).
+    """
+    if domain in _mx_cache:
+        cached = _mx_cache[domain]
+        return (True, "") if cached else (False, f"Domain {domain!r} has no mail servers (no MX records)")
+    try:
+        import dns.resolver
+        dns.resolver.resolve(domain, "MX")
+        _mx_cache[domain] = True
+        return True, ""
+    except Exception as exc:
+        _mx_cache[domain] = False
+        return False, f"Domain {domain!r} has no mail servers: {exc}"
+
+
+def validate_email(email: str, check_deliverability: bool = True) -> ValidationResult:
     """
     Validate an email address.
-    
-    Args:
-        email: Email address to validate
-        
-    Returns:
-        ValidationResult with validation status
+    Step 1 — syntax/format check (instant).
+    Step 2 — DNS MX lookup to confirm the domain actually receives mail (cached per domain).
+
+    Pass check_deliverability=False to skip the MX step (format-only, fast).
     """
     if not email or not isinstance(email, str):
-        return ValidationResult(
-            is_valid=False,
-            error_message="Email is empty or not a string"
-        )
-    
+        return ValidationResult(is_valid=False, error_message="Email is empty or not a string")
+
     email = email.strip().lower()
-    
+
+    # Step 1: format
     try:
-        # Use email_validator for comprehensive validation
         valid = email_validate(email, check_deliverability=False)
         domain = valid.domain
-        return ValidationResult(
-            is_valid=True,
-            email=valid.email,
-            domain=domain
-        )
+        normalized = valid.email
     except EmailNotValidError as e:
-        return ValidationResult(
-            is_valid=False,
-            email=email,
-            error_message=str(e)
-        )
+        return ValidationResult(is_valid=False, email=email, error_message=str(e))
+
+    if not check_deliverability:
+        return ValidationResult(is_valid=True, email=normalized, domain=domain)
+
+    # Step 2: DNS MX check (cached — fast for repeated domains)
+    try:
+        import dns.resolver  # noqa: F401 — just test import
+    except ImportError:
+        # dnspython not installed — fall back to format-only
+        return ValidationResult(is_valid=True, email=normalized, domain=domain)
+
+    mx_ok, mx_err = _check_mx(domain)
+    if not mx_ok:
+        return ValidationResult(is_valid=False, email=normalized, domain=domain, error_message=mx_err)
+
+    return ValidationResult(is_valid=True, email=normalized, domain=domain)
 
 
 def validate_lead(lead: dict) -> ValidationResult:

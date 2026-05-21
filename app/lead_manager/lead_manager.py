@@ -37,16 +37,10 @@ def save_external_leads(
         cursor = conn.cursor()
         
         for lead in leads:
-            email = lead.get("email", "").strip()
-            if not email:
+            email = lead.get("email", "").strip().lower()
+            if not email or '@' not in email:
                 continue
-            
-            # Validate email
-            validation = validate_email(email)
-            if not validation.is_valid:
-                errors.append(f"Invalid email: {email}")
-                continue
-            
+
             domain = extract_domain(email)
             
             try:

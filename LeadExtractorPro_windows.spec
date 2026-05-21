@@ -58,6 +58,11 @@ hiddenimports = [
     '_cffi_backend',
     'keyring',
     'email_validator',
+    'dns',
+    'dns.resolver',
+    'dns.rdatatype',
+    'dns.rdataclass',
+    'dns.exception',
     # Stdlib email (different from app.email - prevents resolution to wrong package)
     'email',
     'email.mime',

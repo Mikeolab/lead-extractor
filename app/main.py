@@ -283,6 +283,134 @@ if "emails_collected" not in st.session_state:
     st.session_state.emails_collected = 0
 if "ext_leads_last_imported" not in st.session_state:
     st.session_state.ext_leads_last_imported = 0
+if "ext_validation_results" not in st.session_state:
+    st.session_state.ext_validation_results = None
+if "extracted_validation_results" not in st.session_state:
+    st.session_state.extracted_validation_results = None
+
+
+def _run_validation_with_progress(leads: list) -> dict:
+    """
+    Validate + deduplicate a list of lead dicts.
+    Phase 1: parallel DNS MX pre-fetch for all unique domains (20 threads).
+    Phase 2: per-email format+MX check using the warm cache (fast).
+    Returns a results dict compatible with both tabs.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from app.lead_manager.validator import _check_mx, validate_email as _vld
+
+    total = len(leads)
+    bar = st.progress(0, text=f"Phase 1/2: finding unique domains…")
+    status = st.empty()
+
+    # Extract unique domains
+    unique_domains: list = []
+    seen_d: set = set()
+    for lead in leads:
+        email = (lead.get("email") or "").strip().lower()
+        if "@" in email:
+            domain = email.split("@", 1)[1]
+            if domain not in seen_d:
+                seen_d.add(domain)
+                unique_domains.append(domain)
+
+    n_domains = len(unique_domains)
+    status.caption(f"Found {n_domains} unique domain(s) across {total:,} leads — checking mail servers…")
+
+    # Phase 1: parallel MX lookups
+    completed = 0
+    with ThreadPoolExecutor(max_workers=25) as pool:
+        futures = {pool.submit(_check_mx, d): d for d in unique_domains}
+        for fut in as_completed(futures):
+            completed += 1
+            bar.progress(completed / n_domains * 0.5,
+                         text=f"Phase 1/2: checked {completed}/{n_domains} domains…")
+
+    # Phase 2: validate each lead using cached MX results
+    valid_ids, invalid_ids, dup_ids = [], [], []
+    valid_leads_data, invalid_detail = [], []
+    seen_emails: set = set()
+
+    bar.progress(0.5, text="Phase 2/2: validating emails…")
+    UPDATE_EVERY = max(1, total // 200)  # update bar ~200 times
+
+    for i, lead in enumerate(leads):
+        email = (lead.get("email") or "").strip().lower()
+        if not email:
+            continue
+        if email in seen_emails:
+            dup_ids.append(lead.get("id"))
+        else:
+            seen_emails.add(email)
+            result = _vld(email)
+            if result.is_valid:
+                valid_ids.append(lead.get("id"))
+                valid_leads_data.append(lead)
+            else:
+                invalid_ids.append(lead.get("id"))
+                invalid_detail.append(f"{email} — {result.error_message}")
+
+        if i % UPDATE_EVERY == 0:
+            pct = 0.5 + (i / total) * 0.5
+            bar.progress(pct, text=f"Phase 2/2: {i+1:,} / {total:,} validated…")
+
+    bar.progress(1.0, text="Done!")
+    status.empty()
+
+    return {
+        "valid_ids": valid_ids,
+        "invalid_ids": invalid_ids,
+        "dup_ids": dup_ids,
+        "valid_leads_data": valid_leads_data,
+        "invalid_detail": invalid_detail,
+        "valid_count": len(valid_ids),
+        "invalid_count": len(invalid_ids),
+        "dup_count": len(dup_ids),
+        "total_checked": total,
+    }
+
+
+def _render_validation_results(vr: dict, dl_key_prefix: str) -> None:
+    """Render the validation results panel (shared by both tabs)."""
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1.metric("Checked", f"{vr['total_checked']:,}")
+    mc2.metric("✅ Valid unique", f"{vr['valid_count']:,}")
+    mc3.metric("🔁 Duplicates", f"{vr['dup_count']:,}")
+    mc4.metric("❌ Invalid", f"{vr['invalid_count']:,}")
+
+    if vr["invalid_detail"]:
+        with st.expander(f"Show {vr['invalid_count']:,} invalid email(s)"):
+            st.code("\n".join(vr["invalid_detail"][:500]))
+
+    removable = len(vr["invalid_ids"]) + len(vr["dup_ids"])
+    if removable:
+        st.info(
+            f"**{removable:,} rows can be removed** — "
+            f"{vr['dup_count']:,} duplicates + {vr['invalid_count']:,} invalid. "
+            f"After cleaning: **{vr['valid_count']:,} unique valid leads**."
+        )
+
+    act1, act2 = st.columns(2)
+    with act1:
+        if vr["valid_leads_data"]:
+            vdf = pd.DataFrame(vr["valid_leads_data"])
+            vcols = [c for c in ["email", "domain", "contact_name", "business_name", "phone"] if c in vdf.columns]
+            st.download_button(
+                f"⬇️ Download valid only ({vr['valid_count']:,})",
+                data=vdf[vcols].to_csv(index=False),
+                file_name="leads_valid_unique.csv",
+                mime="text/csv",
+                key=f"{dl_key_prefix}_dl_valid",
+            )
+    with act2:
+        st.download_button(
+            "⬇️ Download all (no filter)",
+            data=pd.DataFrame(vr["valid_leads_data"] + []).to_csv(index=False) if vr["valid_leads_data"] else "",
+            file_name="leads_all.csv",
+            mime="text/csv",
+            key=f"{dl_key_prefix}_dl_all",
+            disabled=not vr["valid_leads_data"],
+        )
 
 
 def generate_queries(footprints: list, patterns: list, locations: list) -> list:
@@ -1340,6 +1468,25 @@ def render_saved_leads_page():
                     if st.button("📊 Save Excel", key="save_merged_xlsx"):
                         st.success(f"✅ {export_to_excel(export_leads, f'merged_{len(export_leads)}_leads.xlsx', columns=COLUMN_PRESETS[preset])}")
 
+                # ── Validate merged leads ─────────────────────────────────────
+                st.divider()
+                st.markdown("**Validate & deduplicate merged leads:**")
+                st.caption("DNS MX check per domain + dedup. Run after selecting sessions to get a clean export.")
+                if st.button("✅ Validate & Deduplicate merged leads", key="ext_validate_btn"):
+                    if export_leads:
+                        st.session_state.extracted_validation_results = _run_validation_with_progress(export_leads)
+                        st.rerun()
+                    else:
+                        st.warning("No leads to validate.")
+
+                evr = st.session_state.extracted_validation_results
+                if evr:
+                    st.divider()
+                    _render_validation_results(evr, dl_key_prefix="ext_saved")
+                    if st.button("✖ Clear results", key="ext_clear_vr"):
+                        st.session_state.extracted_validation_results = None
+                        st.rerun()
+
             st.divider()
             st.markdown("### 🔍 Individual Sessions")
             single_preset = st.selectbox("Export columns (per session)", list(COLUMN_PRESETS.keys()), key="single_preset")
@@ -1379,13 +1526,13 @@ def render_saved_leads_page():
     # ════════════════════════════════════════════════════════════════════════════
     with tab_upload:
         st.markdown("### 📤 Upload Personal Leads")
-        st.caption("Import your own lead list from any file. Supports `.txt` (one email per line), `.csv`, `.xlsx`, `.json`.")
+        st.caption("Import your own lead list. Supports `.txt` (one email per line), `.csv`, `.xlsx`, `.json`.")
 
         # ── Upload widget ────────────────────────────────────────────────────
         uploaded_file = st.file_uploader(
             "Choose a file",
             type=["txt", "csv", "xlsx", "json", "xls", "tsv"],
-            help="TXT: one email per line · CSV/XLSX: auto-detects email column · JSON: array or object with leads key",
+            help="TXT: one email per line · CSV/XLSX: auto-detects Email column · JSON: array or {leads:[...]}",
         )
 
         if uploaded_file:
@@ -1393,13 +1540,11 @@ def render_saved_leads_page():
             file_name = uploaded_file.name
             st.info(f"📄 {file_name} — {len(file_bytes):,} bytes")
 
-            # Preview
-            if st.checkbox("Preview file content", value=True, key="ul_preview_toggle"):
+            if st.checkbox("Preview file content", value=False, key="ul_preview_toggle"):
                 try:
                     if file_name.lower().endswith((".txt", ".tsv", ".csv", ".json")):
                         preview_text = file_bytes.decode("utf-8", errors="ignore")
-                        lines = preview_text.splitlines()[:12]
-                        st.code("\n".join(lines), language="text")
+                        st.code("\n".join(preview_text.splitlines()[:15]), language="text")
                     else:
                         st.caption("Binary file — preview not available")
                 except Exception as ex:
@@ -1414,124 +1559,194 @@ def render_saved_leads_page():
                             for m in parse_msgs:
                                 st.caption(m)
                         else:
-                            saved_count, save_msgs = save_external_leads(leads_parsed, source="manual_upload", file_name=file_name)
-                            st.success(f"✅ {saved_count} leads imported from {file_name}")
-                            for m in (parse_msgs + save_msgs):
+                            saved_count, save_msgs = save_external_leads(
+                                leads_parsed, source="manual_upload", file_name=file_name
+                            )
+                            dupes = sum(1 for m in save_msgs if "already exists" in m)
+                            st.success(
+                                f"✅ {saved_count} leads imported from {file_name}"
+                                + (f" · {dupes} skipped (duplicates)" if dupes else "")
+                            )
+                            for m in parse_msgs:
                                 if m:
                                     st.caption(m)
                             st.session_state.ext_leads_last_imported = saved_count
+                            st.rerun()
                     except Exception as ex:
                         st.error(f"Import failed: {ex}")
 
         st.divider()
 
-        # ── Domain Stats ─────────────────────────────────────────────────────
-        st.markdown("### 📊 Domain Breakdown")
+        # ── Totals + Domain Breakdown ────────────────────────────────────────
         try:
             domain_stats = get_domain_statistics()
         except Exception:
             domain_stats = {}
 
-        if domain_stats:
+        total_ext = sum(domain_stats.values()) if domain_stats else 0
+
+        if total_ext:
+            st.metric("Total external leads stored", f"{total_ext:,}")
+            st.markdown("**Domain breakdown** (top 30):")
             df_domains = pd.DataFrame(
-                [{"Domain": d, "Count": c} for d, c in list(domain_stats.items())[:30]],
+                [{"Domain": d, "Count": c} for d, c in list(domain_stats.items())[:30]]
             )
-            st.dataframe(df_domains, use_container_width=True, hide_index=True,
+            st.dataframe(
+                df_domains, use_container_width=True, hide_index=True,
                 column_config={
                     "Domain": st.column_config.TextColumn("📧 Domain", width="large"),
                     "Count": st.column_config.NumberColumn("Leads", width="small"),
-                })
-            total_ext = sum(domain_stats.values())
-            st.caption(f"Total external leads stored: **{total_ext:,}** across {len(domain_stats)} domain(s)")
+                },
+            )
         else:
             st.info("No external leads imported yet. Upload a file above.")
 
+        if not total_ext:
+            return
+
         st.divider()
+        st.markdown("### 🔍 Filter, Browse & Validate")
 
-        # ── Filter + View ─────────────────────────────────────────────────────
-        st.markdown("### 🔍 Filter & Validate")
+        # ── Controls row ─────────────────────────────────────────────────────
+        fc1, fc2, fc3 = st.columns([3, 2, 2])
+        with fc1:
+            domain_filter_input = st.text_input(
+                "Filter by domain",
+                key="ul_domain_filter",
+                placeholder="e.g. gmail.com — leave empty for all",
+            )
+        with fc2:
+            page_size = st.selectbox(
+                "Leads per page", [50, 100, 200, 500], index=1, key="ul_page_size"
+            )
+        with fc3:
+            # Total matching count for pagination
+            try:
+                _all = get_external_leads(limit=100_000, domain_filter=domain_filter_input.strip() or None)
+                match_total = len(_all)
+            except Exception:
+                match_total = 0
+            max_page = max(1, (match_total + page_size - 1) // page_size)
+            page_num = st.number_input(
+                f"Page (1 – {max_page})",
+                min_value=1, max_value=max_page, value=1, step=1, key="ul_page_num",
+            )
 
-        domain_filter_input = st.text_input(
-            "Filter by domain (e.g. gmail.com or comcast.net)", key="ul_domain_filter",
-            placeholder="Leave empty to show all",
-        )
-
+        offset = (page_num - 1) * page_size
         try:
-            ext_leads = get_external_leads(limit=5000, domain_filter=domain_filter_input.strip() or None)
+            ext_leads = get_external_leads(
+                limit=page_size, offset=offset,
+                domain_filter=domain_filter_input.strip() or None,
+            )
         except Exception:
             ext_leads = []
 
-        if ext_leads:
-            st.caption(f"Showing {len(ext_leads):,} lead(s)" + (f" matching `{domain_filter_input}`" if domain_filter_input else ""))
+        if match_total:
+            first = offset + 1
+            last = min(offset + page_size, match_total)
+            st.caption(
+                f"Showing leads **{first:,} – {last:,}** of **{match_total:,}**"
+                + (f" matching `{domain_filter_input}`" if domain_filter_input else "")
+            )
 
-            # Validate button
-            if st.button("✅ Validate emails", key="ul_validate_btn"):
-                valid_n = invalid_n = 0
-                invalid_list = []
-                for lead in ext_leads:
+        # ── Action buttons ────────────────────────────────────────────────────
+        btn_c1, btn_c2, btn_c3 = st.columns(3)
+        with btn_c1:
+            validate_all_clicked = st.button(
+                "✅ Validate & Deduplicate", key="ul_validate_btn",
+                help="DNS MX check per domain + dedup. Progress bar shows live status.",
+            )
+        with btn_c2:
+            dup_check_clicked = st.button("🔗 Check duplicates vs extracted", key="ul_dup_check")
+        with btn_c3:
+            clear_clicked = st.button("🗑️ Clear all external leads", key="ul_clear_all", type="secondary")
+
+        # ── Run validation with progress bar ─────────────────────────────────
+        if validate_all_clicked:
+            check_leads = _all if match_total else []
+            if check_leads:
+                st.session_state.ext_validation_results = _run_validation_with_progress(check_leads)
+                st.rerun()
+
+        # ── Show persistent validation results ───────────────────────────────
+        vr = st.session_state.ext_validation_results
+        if vr:
+            st.divider()
+            _render_validation_results(vr, dl_key_prefix="ul_ext")
+
+            removable_ids = [i for i in (vr["invalid_ids"] + vr["dup_ids"]) if i is not None]
+            ra, rb = st.columns(2)
+            with ra:
+                if removable_ids and st.button(
+                    f"🧹 Remove {len(removable_ids):,} dupes & invalid from DB",
+                    key="ul_remove_invalid", type="primary",
+                ):
+                    deleted, _ = delete_external_leads(removable_ids)
+                    st.success(f"{deleted:,} rows removed. {vr['valid_count']:,} unique valid leads remain.")
+                    st.session_state.ext_validation_results = None
+                    st.rerun()
+            with rb:
+                if st.button("✖ Clear results", key="ul_clear_vr"):
+                    st.session_state.ext_validation_results = None
+                    st.rerun()
+
+        # ── Duplicate check ───────────────────────────────────────────────────
+        if dup_check_clicked:
+            check_leads = _all[:5000] if match_total else []
+            dupes = []
+            with st.spinner("Checking duplicates…"):
+                for lead in check_leads:
                     email = lead.get("email", "")
                     if email:
-                        result = validate_email(email)
-                        if result.is_valid:
-                            valid_n += 1
-                        else:
-                            invalid_n += 1
-                            invalid_list.append(f"{email} — {result.error_message}")
-                st.success(f"✅ Valid: {valid_n}")
-                if invalid_n:
-                    st.warning(f"❌ Invalid: {invalid_n}")
-                    with st.expander(f"Show {invalid_n} invalid email(s)"):
-                        st.code("\n".join(invalid_list[:100]))
+                        match = compare_with_extracted_leads(email)
+                        if match and match.get("found"):
+                            dupes.append(f"{email} → found in session #{match.get('lead_id')}")
+            if dupes:
+                st.warning(f"Found {len(dupes)} duplicate(s) in your extracted leads DB:")
+                with st.expander("Show duplicates"):
+                    st.code("\n".join(dupes[:200]))
+            else:
+                st.success("No duplicates found — these leads are unique vs your extracted leads.")
 
-            # Display table
+        # ── Clear all ────────────────────────────────────────────────────────
+        if clear_clicked:
+            try:
+                all_ids = [l["id"] for l in _all if l.get("id")]
+                if all_ids:
+                    deleted, _ = delete_external_leads(all_ids)
+                    st.success(f"Deleted {deleted} external lead(s).")
+                    st.session_state.ext_validation_results = None
+                    st.rerun()
+            except Exception as ex:
+                st.error(f"Delete failed: {ex}")
+
+        st.divider()
+
+        # ── Lead table (current page) ─────────────────────────────────────────
+        if ext_leads:
             df_ext = pd.DataFrame(ext_leads)
-            show_ext_cols = [c for c in ["email", "domain", "contact_name", "business_name", "phone", "source"] if c in df_ext.columns]
-            st.dataframe(df_ext[show_ext_cols] if show_ext_cols else df_ext, use_container_width=True, hide_index=True,
+            show_cols = [c for c in ["email", "domain", "contact_name", "business_name", "phone", "source"] if c in df_ext.columns]
+            st.dataframe(
+                df_ext[show_cols] if show_cols else df_ext,
+                use_container_width=True, hide_index=True,
                 column_config={
                     "email": st.column_config.TextColumn("📧 Email", width="large"),
                     "domain": st.column_config.TextColumn("Domain", width="medium"),
                     "contact_name": st.column_config.TextColumn("Name", width="medium"),
-                })
+                    "business_name": st.column_config.TextColumn("Business", width="medium"),
+                },
+            )
 
-            # Export
-            st.markdown("**Export filtered leads:**")
-            ex1, ex2 = st.columns(2)
-            with ex1:
-                st.download_button(
-                    "⬇️ Download CSV", key="ul_dl_csv", mime="text/csv",
-                    data=pd.DataFrame(ext_leads).to_csv(index=False),
-                    file_name=f"external_leads{'_' + domain_filter_input if domain_filter_input else ''}.csv",
-                )
-            with ex2:
-                # Duplicate check vs extracted leads
-                if st.button("🔗 Check duplicates vs extracted", key="ul_dup_check"):
-                    dupes = []
-                    for lead in ext_leads[:2000]:
-                        email = lead.get("email", "")
-                        if email:
-                            match = compare_with_extracted_leads(email)
-                            if match and match.get("found"):
-                                dupes.append(f"{email} → found in session #{match.get('lead_id')}")
-                    if dupes:
-                        st.warning(f"Found {len(dupes)} duplicate(s) in your extracted leads DB:")
-                        with st.expander("Show duplicates"):
-                            st.code("\n".join(dupes[:100]))
-                    else:
-                        st.success("No duplicates found — these leads are unique vs your extracted leads.")
-
-            # Clear all external leads
-            st.divider()
-            if st.button("🗑️ Clear all external leads", key="ul_clear_all", type="secondary"):
-                try:
-                    ids = [l["id"] for l in ext_leads if l.get("id")]
-                    if ids:
-                        deleted, msg = delete_external_leads(ids)
-                        st.success(f"Deleted {deleted} external lead(s). {msg}")
-                        st.rerun()
-                except Exception as ex:
-                    st.error(f"Delete failed: {ex}")
+        # ── Export (entire filtered set) ───────────────────────────────────────
+        if match_total:
+            dl_data = pd.DataFrame(_all).to_csv(index=False) if _all else ""
+            st.download_button(
+                f"⬇️ Download all filtered ({match_total:,} leads)", key="ul_dl_csv",
+                data=dl_data, mime="text/csv",
+                file_name=f"external_leads{'_' + domain_filter_input if domain_filter_input else ''}.csv",
+            )
         else:
-            st.info("No external leads match your filter. Import leads above or change the domain filter.")
+            st.info("No external leads match your filter.")
 
 
 # ─── Settings Page ────────────────────────────────────────────────────────────
