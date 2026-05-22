@@ -29,6 +29,7 @@ from app.database.db import (
     get_searches_for_queries,
     get_leads_by_search,
     maybe_prune_stale_searches,
+    delete_leads_by_ids,
 )
 from app.export.exporter import (
     export_to_csv,
@@ -299,32 +300,43 @@ def _run_validation_with_progress(leads: list) -> dict:
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from app.lead_manager.validator import _check_mx, validate_email as _vld
 
-    total = len(leads)
-    bar = st.progress(0, text=f"Phase 1/2: finding unique domains…")
+    bar = st.progress(0, text="Phase 1/2: finding unique domains…")
     status = st.empty()
 
-    # Extract unique domains
+    # Pre-filter: only leads that actually have an email address.
+    # Leads without emails are skipped but counting them in "total" would make
+    # the metrics misleading (valid + dup + invalid ≠ checked).
+    leads_with_email = [l for l in leads if "@" in (l.get("email") or "")]
+    no_email_count = len(leads) - len(leads_with_email)
+    total = len(leads_with_email)
+
+    # Extract unique domains for Phase 1
     unique_domains: list = []
     seen_d: set = set()
-    for lead in leads:
-        email = (lead.get("email") or "").strip().lower()
-        if "@" in email:
-            domain = email.split("@", 1)[1]
-            if domain not in seen_d:
-                seen_d.add(domain)
-                unique_domains.append(domain)
+    for lead in leads_with_email:
+        domain = (lead.get("email") or "").strip().lower().split("@", 1)[1]
+        if domain not in seen_d:
+            seen_d.add(domain)
+            unique_domains.append(domain)
 
     n_domains = len(unique_domains)
-    status.caption(f"Found {n_domains} unique domain(s) across {total:,} leads — checking mail servers…")
+    status.caption(
+        f"Found {n_domains} unique domain(s) across {total:,} leads"
+        + (f" ({no_email_count:,} skipped — no email)" if no_email_count else "")
+        + " — checking mail servers…"
+    )
 
     # Phase 1: parallel MX lookups
     completed = 0
-    with ThreadPoolExecutor(max_workers=25) as pool:
-        futures = {pool.submit(_check_mx, d): d for d in unique_domains}
-        for fut in as_completed(futures):
-            completed += 1
-            bar.progress(completed / n_domains * 0.5,
-                         text=f"Phase 1/2: checked {completed}/{n_domains} domains…")
+    if unique_domains:
+        with ThreadPoolExecutor(max_workers=25) as pool:
+            futures = {pool.submit(_check_mx, d): d for d in unique_domains}
+            for fut in as_completed(futures):
+                completed += 1
+                bar.progress(
+                    completed / n_domains * 0.5,
+                    text=f"Phase 1/2: checked {completed}/{n_domains} domains…",
+                )
 
     # Phase 2: validate each lead using cached MX results
     valid_ids, invalid_ids, dup_ids = [], [], []
@@ -334,10 +346,8 @@ def _run_validation_with_progress(leads: list) -> dict:
     bar.progress(0.5, text="Phase 2/2: validating emails…")
     UPDATE_EVERY = max(1, total // 200)  # update bar ~200 times
 
-    for i, lead in enumerate(leads):
+    for i, lead in enumerate(leads_with_email):
         email = (lead.get("email") or "").strip().lower()
-        if not email:
-            continue
         if email in seen_emails:
             dup_ids.append(lead.get("id"))
         else:
@@ -351,7 +361,7 @@ def _run_validation_with_progress(leads: list) -> dict:
                 invalid_detail.append(f"{email} — {result.error_message}")
 
         if i % UPDATE_EVERY == 0:
-            pct = 0.5 + (i / total) * 0.5
+            pct = 0.5 + (i / total) * 0.5 if total else 1.0
             bar.progress(pct, text=f"Phase 2/2: {i+1:,} / {total:,} validated…")
 
     bar.progress(1.0, text="Done!")
@@ -367,6 +377,7 @@ def _run_validation_with_progress(leads: list) -> dict:
         "invalid_count": len(invalid_ids),
         "dup_count": len(dup_ids),
         "total_checked": total,
+        "no_email_count": no_email_count,
     }
 
 
@@ -377,6 +388,8 @@ def _render_validation_results(vr: dict, dl_key_prefix: str) -> None:
     mc2.metric("✅ Valid unique", f"{vr['valid_count']:,}")
     mc3.metric("🔁 Duplicates", f"{vr['dup_count']:,}")
     mc4.metric("❌ Invalid", f"{vr['invalid_count']:,}")
+    if vr.get("no_email_count"):
+        st.caption(f"ℹ️ {vr['no_email_count']:,} row(s) had no email address and were excluded from validation.")
 
     if vr["invalid_detail"]:
         with st.expander(f"Show {vr['invalid_count']:,} invalid email(s)"):
@@ -585,17 +598,22 @@ def drain_ws_queue(msg_queue: Queue) -> bool:
                 st.session_state.last_update = now
                 changed = True
         elif msg_type == "leads":
-            st.session_state.extracted_leads.extend(data)
-            st.session_state.current_lead_count = len(st.session_state.extracted_leads)
-            st.session_state.needs_refresh = True
-            st.session_state.last_update = time.time()
-            changed = True
+            # Only update lead buffers while a run is actively in progress.
+            # If stop was already clicked, discard stale in-flight messages so
+            # the counter freezes immediately rather than continuing to climb.
+            if st.session_state.get("is_running"):
+                st.session_state.extracted_leads.extend(data)
+                st.session_state.current_lead_count = len(st.session_state.extracted_leads)
+                st.session_state.needs_refresh = True
+                st.session_state.last_update = time.time()
+                changed = True
         elif msg_type == "lead_count":
-            st.session_state.current_lead_count, st.session_state.target_lead_count = data
-            st.session_state.emails_collected = data[0]
-            st.session_state.needs_refresh = True
-            st.session_state.last_update = time.time()
-            changed = True
+            if st.session_state.get("is_running"):
+                st.session_state.current_lead_count, st.session_state.target_lead_count = data
+                st.session_state.emails_collected = data[0]
+                st.session_state.needs_refresh = True
+                st.session_state.last_update = time.time()
+                changed = True
         elif msg_type == "query_progress":
             st.session_state.query_current = data.get("current_query", "")
             st.session_state.query_progress_idx = data.get("current", 0)
@@ -1151,15 +1169,34 @@ def render_extractor_page():
 
     if stop_btn:
         st.session_state.is_running = False
+        # Flush every pending message from the queue NOW so the counter freezes
+        # immediately — stale lead_count / leads updates are discarded.
+        _stop_q = st.session_state.get("ws_message_queue")
+        if _stop_q:
+            try:
+                while True:
+                    _stop_q.get_nowait()
+            except Empty:
+                pass
+        # 1. Try WebSocket stop command (fast path)
         ws = _ws_client_ref[0] if _ws_client_ref else None
         if ws:
             try:
                 ws.send(json.dumps({"command": "stop"}))
                 st.session_state.activity_log.append("Stop sent to automation service.")
             except Exception as e:
-                st.session_state.activity_log.append(f"Stop requested ({str(e)[:50]}).")
-        else:
-            st.session_state.activity_log.append("Stopped (no active connection).")
+                st.session_state.activity_log.append(f"WS stop failed ({str(e)[:40]}), trying HTTP…")
+                ws = None
+        # 2. Always also hit the HTTP /stop endpoint — this cancels the asyncio
+        #    Task directly on the server, guaranteeing the background run halts
+        #    even if the WebSocket connection was already closed.
+        try:
+            import httpx
+            httpx.post(f"{AUTOMATION_SERVER_URL.rstrip('/')}/stop", timeout=3)
+        except Exception:
+            pass  # Server not reachable — WS stop is sufficient if it worked
+        if not ws:
+            st.session_state.activity_log.append("Stop signal sent via HTTP.")
         st.rerun()
 
     if start_btn:
@@ -1167,6 +1204,16 @@ def render_extractor_page():
         if not queries:
             st.warning("Need at least one entry in each column (Footprint, @Pattern, Location).")
         else:
+            # Flush any leftover messages from the previous run before resetting
+            # state, so stale lead_count updates can't bleed into the new run.
+            _old_q = st.session_state.get("ws_message_queue")
+            if _old_q:
+                try:
+                    while True:
+                        _old_q.get_nowait()
+                except Empty:
+                    pass
+
             st.session_state.is_running = True
             st.session_state.extracted_leads = []
             st.session_state.activity_log = []
@@ -1480,21 +1527,39 @@ def render_saved_leads_page():
                 # ── Validate merged leads ─────────────────────────────────────
                 st.divider()
                 st.markdown("**Validate & deduplicate merged leads:**")
-                st.caption("DNS MX check per domain + dedup. Run after selecting sessions to get a clean export.")
+                st.caption("DNS MX check per domain + dedup. Finds invalid emails and removes duplicates from DB.")
+
+                _val_placeholder = st.empty()  # Progress bar renders here
                 if st.button("✅ Validate & Deduplicate merged leads", key="ext_validate_btn"):
                     if export_leads:
-                        st.session_state.extracted_validation_results = _run_validation_with_progress(export_leads)
+                        with _val_placeholder.container():
+                            st.session_state.extracted_validation_results = _run_validation_with_progress(export_leads)
                         st.rerun()
                     else:
-                        st.warning("No leads to validate.")
+                        st.warning("No leads to validate. Select at least one session above.")
 
                 evr = st.session_state.extracted_validation_results
                 if evr:
                     st.divider()
                     _render_validation_results(evr, dl_key_prefix="ext_saved")
-                    if st.button("✖ Clear results", key="ext_clear_vr"):
-                        st.session_state.extracted_validation_results = None
-                        st.rerun()
+
+                    # Allow removal of invalid + duplicate rows from the leads DB
+                    ext_removable = [i for i in (evr["invalid_ids"] + evr["dup_ids"]) if i is not None]
+                    ext_ra, ext_rb = st.columns(2)
+                    with ext_ra:
+                        if ext_removable and st.button(
+                            f"🧹 Remove {len(ext_removable):,} dupes & invalid from DB",
+                            key="ext_remove_invalid", type="primary",
+                        ):
+                            with st.spinner(f"Removing {len(ext_removable):,} rows…"):
+                                deleted = delete_leads_by_ids(ext_removable)
+                            st.success(f"{deleted:,} rows removed from extracted leads DB.")
+                            st.session_state.extracted_validation_results = None
+                            st.rerun()
+                    with ext_rb:
+                        if st.button("✖ Clear results", key="ext_clear_vr"):
+                            st.session_state.extracted_validation_results = None
+                            st.rerun()
 
             st.divider()
             st.markdown("### 🔍 Individual Sessions")

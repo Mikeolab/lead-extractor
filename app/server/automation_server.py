@@ -181,6 +181,7 @@ class AutomationManager:
         self.playwright = None
         self.is_running = False
         self.stop_flag = False
+        self.task = None  # asyncio Task for run_automation — stored so Stop can cancel it
         self.last_screenshot_time = 0
         self.screenshot_throttle = 1.0  # Max 1 screenshot per second
         self.all_leads_buffer = []  # Buffer to save on disconnect
@@ -1913,6 +1914,58 @@ class AutomationManager:
 manager = AutomationManager()
 
 
+async def _do_stop(mgr: AutomationManager) -> None:
+    """
+    Hard-stop the running automation.
+    1. Set flags so every stop_flag check inside run_automation exits its loop.
+    2. Cancel the asyncio Task — raises CancelledError at the next await point,
+       which unwinds the coroutine even if it's deep inside a page scrape.
+    3. Shut down Playwright so the visible browser window closes immediately.
+    4. Save buffered leads to DB and broadcast complete.
+    """
+    mgr.stop_flag = True
+    mgr.is_running = False
+
+    # Cancel the task immediately — this is the key fix.
+    # Previously the task ran forever because only stop_flag was set.
+    if mgr.task and not mgr.task.done():
+        mgr.task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(mgr.task), timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass  # Expected — task was cancelled
+
+    await mgr.broadcast({"type": "status", "message": "🛑 Stop requested — saving leads and closing browser…"})
+
+    # Save buffered leads before closing browser
+    if mgr.all_leads_buffer and mgr.current_session_id:
+        try:
+            saved_count = save_leads(mgr.current_session_id, mgr.all_leads_buffer, replace=True)
+            await mgr.broadcast({"type": "status", "message": f"💾 Saved {saved_count} leads to database before stopping"})
+        except Exception as e:
+            await mgr.broadcast({"type": "status", "message": f"⚠️ Error saving leads on stop: {str(e)[:60]}"})
+
+    # Close browser window
+    pw_errs = await mgr.shutdown_playwright()
+    status_msg = f"🔚 Browser shutdown: {', '.join(pw_errs[:3])}" if pw_errs else "🔚 Browser closed"
+    await mgr.broadcast({"type": "status", "message": status_msg})
+
+    # Signal UI that run is complete
+    try:
+        await mgr.broadcast({"type": "complete", "data": mgr.all_leads_buffer or []})
+    except Exception:
+        pass
+
+    mgr.task = None
+
+
+@app.post("/stop")
+async def http_stop():
+    """HTTP fallback stop — works even if the WebSocket connection was dropped."""
+    await _do_stop(manager)
+    return {"status": "stopped", "saved": len(manager.all_leads_buffer)}
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
@@ -1955,8 +2008,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     headless = bool(data.get("headless", False))
                     reload_between_queries = bool(data.get("reload_between_queries", False))
 
-                    # Run automation in background
-                    asyncio.create_task(manager.run_automation(
+                    # Run automation in background — store task so Stop can cancel it
+                    manager.task = asyncio.create_task(manager.run_automation(
                         queries=queries,
                         max_pages=max_pages,
                         delay_between_pages=delay_pages,
@@ -1970,42 +2023,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     ))
 
                 elif command == "stop":
-                    manager.stop_flag = True
-                    manager.is_running = False  # Force stop
-                    await manager.broadcast({"type": "status", "message": "🛑 Stop requested - saving leads and closing browser..."})
-                    
-                    # Save all leads in buffer before stopping
-                    if manager.all_leads_buffer and manager.current_session_id:
-                        try:
-                            saved_count = save_leads(manager.current_session_id, manager.all_leads_buffer, replace=True)
-                            await manager.broadcast({
-                                "type": "status",
-                                "message": f"💾 Saved {saved_count} leads to database before stopping",
-                            })
-                        except Exception as e:
-                            await manager.broadcast({
-                                "type": "status",
-                                "message": f"⚠️ Error saving leads on stop: {str(e)[:60]}",
-                            })
-                    
-                    # Close Playwright immediately so the visible browser window exits (run_automation may still unwind)
-                    pw_errs = await manager.shutdown_playwright()
-                    if pw_errs:
-                        await manager.broadcast({
-                            "type": "status",
-                            "message": f"🔚 Browser shutdown: {', '.join(pw_errs[:3])}",
-                        })
-                    else:
-                        await manager.broadcast({"type": "status", "message": "🔚 Browser closed"})
-
-                    # Force completion signal with all leads
-                    try:
-                        await manager.broadcast({
-                            "type": "complete",
-                            "data": manager.all_leads_buffer if manager.all_leads_buffer else [],
-                        })
-                    except Exception:
-                        pass
+                    await _do_stop(manager)
                     
             except Exception as e:
                 # Log error but keep connection alive

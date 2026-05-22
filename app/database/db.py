@@ -248,6 +248,21 @@ def delete_search(search_id: int) -> None:
     conn.close()
 
 
+def delete_leads_by_ids(lead_ids: list) -> int:
+    """Delete specific leads by ID from the leads table. Returns number deleted."""
+    if not lead_ids:
+        return 0
+    conn = get_connection()
+    placeholders = ",".join("?" for _ in lead_ids)
+    cursor = conn.execute(
+        f"DELETE FROM leads WHERE id IN ({placeholders})", lead_ids
+    )
+    deleted = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+
 def prune_old_searches_and_leads(retention_days: int | None = None) -> dict:
     """
     Delete search sessions and their leads older than retention_days (by searches.created_at).
