@@ -890,19 +890,21 @@ def _render_live_query_sessions_panel():
         )
     with e2:
         if st.button("📄 Save CSV to exports folder", key="live_sess_save_csv"):
-            path = export_to_csv(
-                export_leads,
-                f"merged_live_{len(export_leads)}_leads.csv",
-                columns=export_cols,
-            )
+            with st.spinner("Saving CSV…"):
+                path = export_to_csv(
+                    export_leads,
+                    f"merged_live_{len(export_leads)}_leads.csv",
+                    columns=export_cols,
+                )
             st.success(f"Saved: {path}")
     with e3:
         if st.button("📊 Save Excel to exports folder", key="live_sess_save_xlsx"):
-            path = export_to_excel(
-                export_leads,
-                f"merged_live_{len(export_leads)}_leads.xlsx",
-                columns=export_cols,
-            )
+            with st.spinner("Saving Excel…"):
+                path = export_to_excel(
+                    export_leads,
+                    f"merged_live_{len(export_leads)}_leads.xlsx",
+                    columns=export_cols,
+                )
             st.success(f"Saved: {path}")
 
 
@@ -1318,13 +1320,16 @@ def render_extractor_page():
             e1, e2, e3, e4 = st.columns(4)
             with e1:
                 if st.button("📄 CSV", use_container_width=True, key="exp_csv"):
-                    st.success(f"✅ {export_to_csv(leads_list, columns=export_cols)}")
+                    with st.spinner("Saving CSV…"):
+                        st.success(f"✅ {export_to_csv(leads_list, columns=export_cols)}")
             with e2:
                 if st.button("📊 Excel", use_container_width=True, key="exp_xlsx"):
-                    st.success(f"✅ {export_to_excel(leads_list, columns=export_cols)}")
+                    with st.spinner("Saving Excel…"):
+                        st.success(f"✅ {export_to_excel(leads_list, columns=export_cols)}")
             with e3:
                 if st.button("📕 PDF", use_container_width=True, key="exp_pdf"):
-                    st.success(f"✅ {export_to_pdf(leads_list, query='Batch Results')}")
+                    with st.spinner("Generating PDF…"):
+                        st.success(f"✅ {export_to_pdf(leads_list, query='Batch Results')}")
             with e4:
                 st.download_button(
                     "⬇️ Download", use_container_width=True,
@@ -1463,10 +1468,14 @@ def render_saved_leads_page():
                     )
                 with e2:
                     if st.button("📄 Save CSV", key="save_merged_csv"):
-                        st.success(f"✅ {export_to_csv(export_leads, f'merged_{len(export_leads)}_leads.csv', columns=COLUMN_PRESETS[preset])}")
+                        with st.spinner("Saving CSV…"):
+                            result = export_to_csv(export_leads, f'merged_{len(export_leads)}_leads.csv', columns=COLUMN_PRESETS[preset])
+                        st.success(f"✅ {result}")
                 with e3:
                     if st.button("📊 Save Excel", key="save_merged_xlsx"):
-                        st.success(f"✅ {export_to_excel(export_leads, f'merged_{len(export_leads)}_leads.xlsx', columns=COLUMN_PRESETS[preset])}")
+                        with st.spinner("Saving Excel…"):
+                            result = export_to_excel(export_leads, f'merged_{len(export_leads)}_leads.xlsx', columns=COLUMN_PRESETS[preset])
+                        st.success(f"✅ {result}")
 
                 # ── Validate merged leads ─────────────────────────────────────
                 st.divider()
@@ -1514,10 +1523,12 @@ def render_saved_leads_page():
                                 file_name=f"session_{search_id}.csv")
                         with col2:
                             if st.button("📄 Save CSV", key=f"csv_{search_id}"):
-                                st.success(f"✅ {export_to_csv(leads, f'session_{search_id}', columns=single_cols)}")
+                                with st.spinner("Saving CSV…"):
+                                    st.success(f"✅ {export_to_csv(leads, f'session_{search_id}', columns=single_cols)}")
                         with col3:
                             if st.button("📊 Save Excel", key=f"xlsx_{search_id}"):
-                                st.success(f"✅ {export_to_excel(leads, f'session_{search_id}', columns=single_cols)}")
+                                with st.spinner("Saving Excel…"):
+                                    st.success(f"✅ {export_to_excel(leads, f'session_{search_id}', columns=single_cols)}")
                     else:
                         st.caption("No leads found for this session.")
 
@@ -1681,7 +1692,8 @@ def render_saved_leads_page():
                     f"🧹 Remove {len(removable_ids):,} dupes & invalid from DB",
                     key="ul_remove_invalid", type="primary",
                 ):
-                    deleted, _ = delete_external_leads(removable_ids)
+                    with st.spinner(f"Removing {len(removable_ids):,} rows…"):
+                        deleted, _ = delete_external_leads(removable_ids)
                     st.success(f"{deleted:,} rows removed. {vr['valid_count']:,} unique valid leads remain.")
                     st.session_state.ext_validation_results = None
                     st.rerun()
@@ -1713,7 +1725,8 @@ def render_saved_leads_page():
             try:
                 all_ids = [l["id"] for l in _all if l.get("id")]
                 if all_ids:
-                    deleted, _ = delete_external_leads(all_ids)
+                    with st.spinner(f"Clearing {len(all_ids):,} leads…"):
+                        deleted, _ = delete_external_leads(all_ids)
                     st.success(f"Deleted {deleted} external lead(s).")
                     st.session_state.ext_validation_results = None
                     st.rerun()
@@ -1790,14 +1803,15 @@ def render_settings_page():
 
     # Save button
     if st.button("💾 Save Settings", type="primary", key="save_settings_btn"):
-        new_settings = dict(settings)
-        new_settings["search_engine"] = search_engine
-        new_settings["max_pages"] = max_pages
-        new_settings["delay_pages"] = delay_pages
-        new_settings["delay_actions"] = delay_actions
-        new_settings["headless"] = headless
-        save_settings(new_settings)
-        st.session_state.settings = load_settings()
+        with st.spinner("Saving settings…"):
+            new_settings = dict(settings)
+            new_settings["search_engine"] = search_engine
+            new_settings["max_pages"] = max_pages
+            new_settings["delay_pages"] = delay_pages
+            new_settings["delay_actions"] = delay_actions
+            new_settings["headless"] = headless
+            save_settings(new_settings)
+            st.session_state.settings = load_settings()
         st.success("Settings saved successfully.")
         st.rerun()
 
@@ -1807,21 +1821,17 @@ def render_settings_page():
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 def main():
-    # Check license first - show activation dialog if needed
-    is_valid, user = check_license()
-    
+    # ── License gate ──────────────────────────────────────────────────────────
+    # show_activation_dialog() renders the full activation UI and returns True
+    # only after the user successfully enters and saves a valid key.
+    # st.stop() prevents any app content from rendering below.
+    with st.spinner("Checking license…"):
+        is_valid, user = check_license()
+
     if not is_valid:
-        # Show activation dialog
-        if st.session_state.get("show_activation", True):
-            activated = show_activation_dialog()
-            if activated:
-                st.session_state.show_activation = False
-                st.rerun()
-            else:
-                st.stop()  # Stop app until license is activated
-        else:
-            show_activation_dialog()
-            st.stop()
+        show_activation_dialog()
+        st.stop()
+        return  # unreachable but keeps linters happy
     
     # Render sidebar (always visible)
     render_sidebar()
