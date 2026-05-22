@@ -44,6 +44,7 @@ from app.export.exporter import (
 )
 from app.export.pdf_exporter import export_to_pdf
 from app.config_manager import load_settings, save_settings
+from app.utils.download_ui import download_button_with_fallback
 from app.lead_manager import (
     upload_leads_from_file,
     save_external_leads,
@@ -804,22 +805,22 @@ def _render_validation_results(vr: dict, dl_key_prefix: str) -> None:
         if vr["valid_leads_data"]:
             vdf = pd.DataFrame(vr["valid_leads_data"])
             vcols = [c for c in ["email", "domain", "contact_name", "business_name", "phone"] if c in vdf.columns]
-            st.download_button(
+            download_button_with_fallback(
                 f"⬇️ Download valid only ({vr['valid_count']:,})",
-                data=vdf[vcols].to_csv(index=False),
+                data=vdf[vcols].to_csv(index=False).encode(),
                 file_name="leads_valid_unique.csv",
                 mime="text/csv",
                 key=f"{dl_key_prefix}_dl_valid",
             )
     with act2:
-        st.download_button(
-            "⬇️ Download all (no filter)",
-            data=pd.DataFrame(vr["valid_leads_data"] + []).to_csv(index=False) if vr["valid_leads_data"] else "",
-            file_name="leads_all.csv",
-            mime="text/csv",
-            key=f"{dl_key_prefix}_dl_all",
-            disabled=not vr["valid_leads_data"],
-        )
+        if vr["valid_leads_data"]:
+            download_button_with_fallback(
+                "⬇️ Download all (no filter)",
+                data=pd.DataFrame(vr["valid_leads_data"] + []).to_csv(index=False).encode(),
+                file_name="leads_all.csv",
+                mime="text/csv",
+                key=f"{dl_key_prefix}_dl_all",
+            )
 
 
 def generate_queries(footprints: list, patterns: list, locations: list) -> list:
@@ -1295,7 +1296,7 @@ def _render_live_query_sessions_panel():
     e1, e2, e3 = st.columns(3)
     csv_bytes = leads_to_dataframe(export_leads, columns=export_cols).to_csv(index=False).encode()
     with e1:
-        st.download_button(
+        download_button_with_fallback(
             "⬇️ Download CSV",
             data=csv_bytes,
             file_name="merged_sessions.csv",
