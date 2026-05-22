@@ -168,11 +168,11 @@ exe = EXE(
     upx=False,  # UPX can break cryptography .pyd on Windows
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,  # Show console so we see errors; set False for final clean build
+    console=False,  # Hide console (errors go to logs in AppData/LeadExtractorPro/)
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None,  # Add icon path here if you have one: 'assets/icon.ico'
+    icon='LeadExtractorPro.ico',  # NEXUS ◉ icon (256x256, 128x128, etc.)
 )
