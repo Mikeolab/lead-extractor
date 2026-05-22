@@ -42,8 +42,11 @@ GOOGLE_CSE_ID = os.getenv("GOOGLE_CSE_ID", "")
 # License
 LICENSE_KEY = os.getenv("LICENSE_KEY", "")
 
-# App settings
-APP_NAME = "Lead Extractor Pro"
+# App settings (NEXUS rebrand)
+APP_NAME = "NEXUS — Lead Intelligence"
+BRAND_SHORT = "NEXUS"
+BRAND_TAGLINE = "Lead Intelligence"
+BRAND_GLYPH = "◉"
 APP_VERSION = "1.0.0"
 MAX_RESULTS_PER_SEARCH = 100  # Google CSE max per query cycle
 DEFAULT_RESULTS = 10

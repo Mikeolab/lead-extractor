@@ -1,0 +1,20 @@
+# NEXUS — Streamlit base theme config
+# We render our own NEXUS dark / ATLAS light themes via CSS variables in
+# app/main.py. This config forces a NEUTRAL light base so Streamlit doesn't
+# auto-apply its built-in dark theme (which fights our CSS on widget chrome
+# like number-input arrows, scrollbars, and certain buttons).
+
+[theme]
+base = "light"
+primaryColor = "#6366F1"
+backgroundColor = "#0F0F1A"
+secondaryBackgroundColor = "#1E1E35"
+textColor = "#F1F5F9"
+font = "sans serif"
+
+[server]
+headless = true
+runOnSave = true
+
+[browser]
+gatherUsageStats = false

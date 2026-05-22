@@ -20,7 +20,11 @@ from typing import List
 # Thread-safe ref for WebSocket (Stop button). Session state must NOT be touched from WS thread.
 _ws_client_ref = [None]
 
-from app.config import APP_NAME, APP_VERSION, LICENSE_KEY, LICENSE_SECRET, EXPORT_DIR, WEBSOCKET_URL, AUTOMATION_SERVER_URL, PROJECT_ROOT
+from app.config import (
+    APP_NAME, APP_VERSION, LICENSE_KEY, LICENSE_SECRET, EXPORT_DIR,
+    WEBSOCKET_URL, AUTOMATION_SERVER_URL, PROJECT_ROOT,
+    BRAND_SHORT, BRAND_TAGLINE, BRAND_GLYPH,
+)
 from app.license.validator import validate_license
 from app.license.activation_ui import check_license, show_activation_dialog, show_license_status
 from app.database.db import (
@@ -55,9 +59,9 @@ from app.lead_manager.domain_filter import filter_leads_by_domain, get_domain_st
 # ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title=APP_NAME,
-    page_icon="🎯",
+    page_icon=BRAND_GLYPH,
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",  # NEXUS: sidebar starts hidden, top strip carries status
 )
 
 # Delete lead/search data older than LEADS_RETENTION_DAYS (default 30); runs at most once / 24h
@@ -66,175 +70,567 @@ try:
 except Exception:
     pass
 
-# ─── Custom CSS ──────────────────────────────────────────────────────────────
-st.markdown("""
+# ─── NEXUS Design System ─────────────────────────────────────────────────────
+# Two themes — NEXUS dark (default) and ATLAS light. Active theme's CSS vars
+# are injected directly into :root so the toggle works reliably regardless of
+# Streamlit's iframe sandboxing (a JS-driven [data-theme] attribute can't reach
+# the parent DOM from a markdown-injected <script>).
+if "theme" not in st.session_state:
+    st.session_state.theme = "dark"
+
+# Theme variables — selected at render time based on session state
+if st.session_state.theme == "light":
+    _theme_vars = """
+        --bg:           #F8FAFC;
+        --bg-elev:      #FFFFFF;
+        --surface:      #FFFFFF;
+        --surface-2:    #F1F5F9;
+        --surface-3:    #E2E8F0;
+        --border:       #E2E8F0;
+        --border-soft:  #EDF2F7;
+        --primary:      #4F46E5;
+        --primary-hov:  #4338CA;
+        --primary-dim:  #6366F1;
+        --accent:       #0891B2;
+        --accent-dim:   #0E7490;
+        --success:      #059669;
+        --warning:      #D97706;
+        --danger:       #DC2626;
+        --danger-hov:   #B91C1C;
+        --text-1:       #0F172A;
+        --text-2:       #475569;
+        --text-3:       #94A3B8;
+        --shadow-card:  0 1px 3px rgba(15,23,42,0.06), 0 4px 12px rgba(15,23,42,0.04);
+        --shadow-btn:   0 4px 12px rgba(79, 70, 229, 0.18);
+        --glow-input:   0 0 0 3px rgba(79, 70, 229, 0.18);
+    """
+    # Hardcoded hex fallbacks for button chrome — bypass CSS-var resolution on baseweb elements
+    _btn_bg     = "#F1F5F9"
+    _btn_bg_hov = "#E2E8F0"
+    _btn_text   = "#0F172A"
+    _btn_border = "#E2E8F0"
+else:
+    _theme_vars = """
+        --bg:           #0F0F1A;
+        --bg-elev:      #0A0A14;
+        --surface:      #17172A;
+        --surface-2:    #1E1E35;
+        --surface-3:    #252540;
+        --border:       #2E2E50;
+        --border-soft:  #232340;
+        --primary:      #6366F1;
+        --primary-hov:  #818CF8;
+        --primary-dim:  #4F46E5;
+        --accent:       #22D3EE;
+        --accent-dim:   #0891B2;
+        --success:      #10B981;
+        --warning:      #F59E0B;
+        --danger:       #EF4444;
+        --danger-hov:   #DC2626;
+        --text-1:       #F1F5F9;
+        --text-2:       #94A3B8;
+        --text-3:       #64748B;
+        --shadow-card:  0 1px 0 rgba(255,255,255,0.04) inset, 0 8px 24px rgba(0,0,0,0.3);
+        --shadow-btn:   0 4px 12px rgba(99, 102, 241, 0.25);
+        --glow-input:   0 0 0 3px rgba(99, 102, 241, 0.25);
+    """
+    # Hardcoded hex fallbacks for button chrome — bypass CSS-var resolution on baseweb elements
+    _btn_bg     = "#1E1E35"
+    _btn_bg_hov = "#252540"
+    _btn_text   = "#F1F5F9"
+    _btn_border = "#2E2E50"
+
+st.markdown(f"""
 <style>
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    .block-container { padding-top: 1rem; }
+    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
-    .app-title {
-        font-size: 1.8rem;
-        font-weight: 700;
-        color: #e94560;
-        margin-bottom: 0;
-    }
-    .app-subtitle {
-        color: #8888a0;
-        font-size: 0.85rem;
-        margin-top: -5px;
-    }
+    /* ── Active theme tokens (swapped via session_state.theme) ───────────── */
+    :root, html, body, .stApp {{
+        {_theme_vars}
+    }}
 
-    .activity-log {
-        background: #0a0a14;
-        border: 2px solid #333350;
-        border-radius: 6px;
-        padding: 10px 14px;
-        font-family: 'Menlo', 'Consolas', monospace;
+    /* ── Hide Streamlit chrome ───────────────────────────────────────────── */
+    #MainMenu, footer, header {{ visibility: hidden; }}
+
+    /* ── App-wide ────────────────────────────────────────────────────────── */
+    html, body, [class*="css"] {{
+        font-family: 'Plus Jakarta Sans', -apple-system, system-ui, sans-serif !important;
+        background: var(--bg) !important;
+        color: var(--text-1) !important;
+    }}
+    .stApp {{ background: var(--bg) !important; }}
+    .block-container {{ padding-top: 0.5rem !important; max-width: 1280px; }}
+
+    /* Typography */
+    h1, h2, h3, h4, h5, h6 {{
+        font-family: 'Plus Jakarta Sans', sans-serif !important;
+        color: var(--text-1) !important;
+        font-weight: 700 !important;
+        letter-spacing: -0.01em;
+    }}
+    p, span, label, div {{ color: var(--text-1); }}
+    .stCaption, .caption, [data-testid="stCaptionContainer"] {{
+        color: var(--text-2) !important;
+        font-size: 0.82rem !important;
+    }}
+    /* Scope code styling to text content only — don't leak into form inputs */
+    .stMarkdown code, .stMarkdown pre, .stMarkdown kbd,
+    p code, li code, span code, h1 code, h2 code, h3 code {{
+        font-family: 'JetBrains Mono', 'Menlo', monospace !important;
+        background: var(--bg-elev) !important;
+        color: var(--accent) !important;
+        border-radius: 4px;
+        padding: 1px 6px;
+        font-size: 0.85em;
+    }}
+
+    /* ── Brand ───────────────────────────────────────────────────────────── */
+    .nexus-brand {{
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-family: 'Plus Jakarta Sans', sans-serif;
+    }}
+    .nexus-glyph {{
+        font-size: 1.4rem;
+        color: var(--accent);
+        text-shadow: 0 0 12px rgba(34, 211, 238, 0.6);
+        animation: nexus-pulse 3s ease-in-out infinite;
+    }}
+    @keyframes nexus-pulse {{
+        0%, 100% {{ opacity: 1; }}
+        50% {{ opacity: 0.7; }}
+    }}
+    .nexus-brand-name {{
+        font-size: 1.1rem;
+        font-weight: 800;
+        color: var(--text-1);
+        letter-spacing: 0.04em;
+    }}
+    .nexus-brand-tag {{
+        font-size: 0.72rem;
+        color: var(--text-2);
+        font-weight: 500;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }}
+
+    /* Page titles */
+    .app-title {{
+        font-size: 1.65rem !important;
+        font-weight: 800 !important;
+        color: var(--text-1) !important;
+        margin: 4px 0 2px 0 !important;
+        letter-spacing: -0.02em;
+    }}
+    .app-subtitle {{
+        color: var(--text-2) !important;
+        font-size: 0.88rem !important;
+        margin: -2px 0 16px 0 !important;
+        font-weight: 500;
+    }}
+
+    /* ── Top status strip ────────────────────────────────────────────────── */
+    .nexus-topbar {{
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 10px 16px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        margin-bottom: 14px;
+        box-shadow: var(--shadow-card);
+    }}
+    .nexus-chip {{
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        padding: 5px 10px;
+        background: var(--surface-2);
+        border: 1px solid var(--border);
+        border-radius: 999px;
         font-size: 0.75rem;
-        color: #a0a0c0;
+        color: var(--text-2);
+        font-weight: 500;
+    }}
+    .nexus-chip-dot {{
+        width: 7px; height: 7px; border-radius: 50%;
+        background: var(--text-3);
+    }}
+    .nexus-chip-dot.live    {{ background: var(--accent); box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.2); animation: live-dot-pulse 1.4s ease-in-out infinite; }}
+    .nexus-chip-dot.success {{ background: var(--success); }}
+    .nexus-chip-dot.warn    {{ background: var(--warning); }}
+    .nexus-chip-dot.danger  {{ background: var(--danger); }}
+
+    /* ── Cards ───────────────────────────────────────────────────────────── */
+    .nexus-card {{
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 18px 20px;
+        margin-bottom: 14px;
+        box-shadow: var(--shadow-card);
+    }}
+    .nexus-card-label {{
+        font-size: 0.7rem;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 0.1em;
+        color: var(--text-2);
+        margin-bottom: 8px;
+    }}
+    .nexus-card-accent {{
+        border-top: 2px solid var(--primary);
+    }}
+
+    /* ── Buttons — hardcoded hex so Streamlit's baseweb/config.toml values
+          (which can survive CSS-var resolution failures) never win ─────── */
+    body .stApp .stButton > button,
+    body .stApp .stDownloadButton > button,
+    .stApp .stButton > button,
+    .stApp .stDownloadButton > button,
+    div[data-testid="stButton"] > button,
+    div[data-testid="stDownloadButton"] > button {{
+        font-family: 'Plus Jakarta Sans', sans-serif !important;
+        font-weight: 600 !important;
+        font-size: 0.85rem !important;
+        border-radius: 8px !important;
+        padding: 8px 16px !important;
+        transition: all 0.15s ease !important;
+        border: 1px solid {_btn_border} !important;
+        background: {_btn_bg} !important;
+        background-color: {_btn_bg} !important;
+        background-image: none !important;
+        color: {_btn_text} !important;
+        -webkit-text-fill-color: {_btn_text} !important;
+        box-shadow: none !important;
+    }}
+    body .stApp .stButton > button *,
+    body .stApp .stDownloadButton > button *,
+    .stApp .stButton > button *,
+    .stApp .stDownloadButton > button *,
+    div[data-testid="stButton"] > button *,
+    div[data-testid="stDownloadButton"] > button * {{
+        color: {_btn_text} !important;
+        -webkit-text-fill-color: {_btn_text} !important;
+        background: transparent !important;
+        background-color: transparent !important;
+    }}
+    body .stApp .stButton > button:hover,
+    body .stApp .stDownloadButton > button:hover,
+    .stApp .stButton > button:hover,
+    .stApp .stDownloadButton > button:hover,
+    div[data-testid="stButton"] > button:hover,
+    div[data-testid="stDownloadButton"] > button:hover {{
+        background: {_btn_bg_hov} !important;
+        background-color: {_btn_bg_hov} !important;
+        background-image: none !important;
+        border-color: var(--primary) !important;
+        color: {_btn_text} !important;
+        -webkit-text-fill-color: {_btn_text} !important;
+    }}
+    .stApp .stButton > button[kind="primary"],
+    .stApp .stDownloadButton > button[kind="primary"] {{
+        background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 100%) !important;
+        background-color: var(--primary) !important;
+        border: none !important;
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
+        box-shadow: var(--shadow-btn) !important;
+    }}
+    .stApp .stButton > button[kind="primary"] *,
+    .stApp .stDownloadButton > button[kind="primary"] * {{
+        color: #FFFFFF !important;
+        -webkit-text-fill-color: #FFFFFF !important;
+        background: transparent !important;
+    }}
+    .stApp .stButton > button[kind="primary"]:hover,
+    .stApp .stDownloadButton > button[kind="primary"]:hover {{
+        filter: brightness(1.12);
+        transform: translateY(-1px);
+    }}
+    .stApp .stButton > button[disabled] {{ opacity: 0.4 !important; cursor: not-allowed !important; }}
+
+    /* ── Tooltips (Streamlit baseweb tooltips show as white otherwise) ───── */
+    [data-baseweb="tooltip"],
+    [role="tooltip"] {{
+        background: var(--surface-3) !important;
+        background-color: var(--surface-3) !important;
+        color: var(--text-1) !important;
+        -webkit-text-fill-color: var(--text-1) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 6px !important;
+        box-shadow: var(--shadow-card) !important;
+        font-size: 0.78rem !important;
+        font-family: 'Plus Jakarta Sans', sans-serif !important;
+        padding: 6px 10px !important;
+    }}
+    [data-baseweb="tooltip"] *,
+    [role="tooltip"] * {{
+        color: var(--text-1) !important;
+        -webkit-text-fill-color: var(--text-1) !important;
+        background: transparent !important;
+    }}
+
+    /* ── Inputs (strong selectors so Streamlit defaults don't win) ───────── */
+    .stTextInput input,
+    .stTextArea textarea,
+    .stNumberInput input,
+    .stSelectbox [data-baseweb="select"] > div,
+    .stDateInput input {{
+        background: var(--surface-2) !important;
+        border: 1px solid var(--border) !important;
+        color: var(--text-1) !important;
+        border-radius: 8px !important;
+        font-family: 'Plus Jakarta Sans', sans-serif !important;
+        -webkit-text-fill-color: var(--text-1) !important;  /* Safari/WebKit fix */
+        caret-color: var(--primary) !important;
+    }}
+    .stTextArea textarea {{
+        font-family: 'JetBrains Mono', monospace !important;
+        font-size: 0.9rem !important;
+        color: var(--text-1) !important;
+        -webkit-text-fill-color: var(--text-1) !important;
+        line-height: 1.55 !important;
+    }}
+    .stTextArea textarea::placeholder,
+    .stTextInput input::placeholder,
+    .stNumberInput input::placeholder {{
+        color: var(--text-3) !important;
+        -webkit-text-fill-color: var(--text-3) !important;
+        opacity: 0.8 !important;
+    }}
+    .stTextInput input:focus,
+    .stTextArea textarea:focus,
+    .stNumberInput input:focus {{
+        border-color: var(--primary) !important;
+        box-shadow: var(--glow-input) !important;
+        outline: none !important;
+    }}
+    /* Streamlit wraps inputs in baseweb containers — force their bg too */
+    [data-baseweb="input"],
+    [data-baseweb="textarea"],
+    [data-baseweb="select"],
+    [data-baseweb="base-input"] {{
+        background: var(--surface-2) !important;
+    }}
+    [data-baseweb="input"] *,
+    [data-baseweb="textarea"] *,
+    [data-baseweb="select"] *,
+    [data-baseweb="base-input"] * {{
+        color: var(--text-1) !important;
+        background-color: transparent !important;
+    }}
+    /* Number input +/- buttons (these stubbornly stay dark otherwise) */
+    .stNumberInput button,
+    .stNumberInput [data-testid="stNumberInputStepDown"],
+    .stNumberInput [data-testid="stNumberInputStepUp"] {{
+        background: var(--surface-3) !important;
+        color: var(--text-1) !important;
+        border-color: var(--border) !important;
+    }}
+    .stNumberInput button:hover {{
+        background: var(--primary) !important;
+        color: #FFFFFF !important;
+    }}
+    /* Checkboxes & radios */
+    .stCheckbox label, .stRadio label {{ color: var(--text-1) !important; }}
+    /* Selectbox dropdown */
+    [data-baseweb="popover"] {{ background: var(--surface) !important; }}
+    [data-baseweb="popover"] * {{ color: var(--text-1) !important; }}
+
+    /* ── Metrics ─────────────────────────────────────────────────────────── */
+    [data-testid="stMetric"] {{
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 14px 16px;
+        box-shadow: var(--shadow-card);
+    }}
+    [data-testid="stMetricLabel"] {{
+        color: var(--text-2) !important;
+        font-size: 0.72rem !important;
+        font-weight: 600 !important;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+    }}
+    [data-testid="stMetricValue"] {{
+        color: var(--text-1) !important;
+        font-family: 'Plus Jakarta Sans', sans-serif !important;
+        font-size: 1.9rem !important;
+        font-weight: 800 !important;
+        letter-spacing: -0.02em;
+    }}
+
+    /* ── Progress bar ────────────────────────────────────────────────────── */
+    .stProgress > div > div > div > div {{
+        background: linear-gradient(90deg, var(--primary), var(--accent)) !important;
+    }}
+    .stProgress > div > div > div {{ background: var(--surface-2) !important; }}
+
+    /* ── Activity log ────────────────────────────────────────────────────── */
+    .activity-log {{
+        background: var(--bg-elev);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 12px 14px;
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.76rem;
+        color: var(--accent);
         max-height: 400px;
         overflow-y: auto;
-        line-height: 1.4;
+        line-height: 1.5;
         white-space: pre-wrap;
-    }
+    }}
+    .activity-log::-webkit-scrollbar {{ width: 6px; }}
+    .activity-log::-webkit-scrollbar-track {{ background: transparent; }}
+    .activity-log::-webkit-scrollbar-thumb {{ background: var(--border); border-radius: 3px; }}
 
-    .status-bar {
-        background: linear-gradient(135deg, #1e1e2e, #2a2a3e);
-        border: 1px solid #333350;
-        border-radius: 4px;
-        padding: 6px 12px;
-        font-family: monospace;
-        font-size: 0.85rem;
-        color: #e0e0e0;
-    }
-
-    .browser-view {
-        border: 2px solid #333350;
-        border-radius: 8px;
-        background: #000;
-        padding: 8px;
-    }
-
-    .top-nav {
-        position: sticky;
-        top: 0;
-        z-index: 999;
+    /* ── Live extraction status bar ──────────────────────────────────────── */
+    .extraction-status-bar {{
         display: flex;
         align-items: center;
-        gap: 10px;
-        padding: 10px;
+        gap: 12px;
+        padding: 14px 18px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-left: 3px solid var(--accent);
         border-radius: 10px;
-        background: linear-gradient(90deg, #f3f7ff, #e8efff);
-        border: 1px solid #d1ddff;
-        margin-bottom: 10px;
-    }
-
-    .top-nav button {
-        background: #ffffff;
-        border: 1px solid #b4c6eb;
-        border-radius: 6px;
-        color: #2f4f84;
-        font-weight: 600;
-        padding: 8px 12px;
-        min-width: 80px;
-    }
-
-    .top-nav button:focus, .top-nav button:hover {
-        background: #e4eafc;
-        border-color: #7490d7;
-    }
-
-    .top-nav button.active {
-        background: #2f65d4;
-        border-color: #1f3f96;
-        color: white;
-    }
-    
-    .bottom-nav {
-        position: fixed;
-        bottom: 0;
-        left: 0;
-        right: 0;
-        background: linear-gradient(135deg, #1e1e2e, #2a2a3e);
-        border-top: 2px solid #333350;
-        padding: 12px 20px;
-        display: flex;
-        justify-content: center;
-        gap: 20px;
-        z-index: 999;
-        box-shadow: 0 -2px 10px rgba(0,0,0,0.3);
-    }
-    
-    .nav-button {
-        padding: 10px 20px;
-        background: #2a2a3e;
-        border: 1px solid #444460;
-        border-radius: 6px;
-        color: #a0a0c0;
-        cursor: pointer;
-        font-size: 0.9rem;
-        transition: all 0.2s;
-    }
-    
-    .nav-button:hover {
-        background: #333350;
-        border-color: #555570;
-        color: #e0e0e0;
-    }
-    
-    .nav-button.active {
-        background: #e94560;
-        border-color: #e94560;
-        color: white;
-        font-weight: 600;
-    }
-    
-    .main-content {
-        padding-bottom: 80px;
-    }
-
-    /* Live extraction — compact status (no full-page flash) */
-    .extraction-status-bar {
-        display: flex;
-        align-items: center;
-        gap: 10px;
-        padding: 10px 14px;
-        background: linear-gradient(90deg, #eef2ff 0%, #f8fafc 100%);
-        border: 1px solid #c7d2fe;
-        border-radius: 8px;
-        margin-bottom: 10px;
-        font-size: 0.9rem;
-        color: #1e293b;
-    }
-    .live-dot {
-        width: 9px;
-        height: 9px;
-        background: #2563eb;
+        margin-bottom: 12px;
+        font-size: 0.92rem;
+        color: var(--text-1);
+        box-shadow: var(--shadow-card);
+    }}
+    .extraction-status-bar code {{
+        background: var(--bg-elev) !important;
+        color: var(--accent) !important;
+        padding: 4px 10px;
+        font-size: 0.85em;
+    }}
+    .live-dot {{
+        width: 10px;
+        height: 10px;
+        background: var(--accent);
         border-radius: 50%;
         flex-shrink: 0;
-        box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.25);
+        box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.22);
         animation: live-dot-pulse 1.4s ease-in-out infinite;
-    }
-    @keyframes live-dot-pulse {
-        0%, 100% { opacity: 1; transform: scale(1); }
-        50% { opacity: 0.45; transform: scale(0.92); }
-    }
-    .extraction-meta {
-        color: #64748b;
-        font-size: 0.82rem;
-    }
-    .extraction-detail {
+    }}
+    @keyframes live-dot-pulse {{
+        0%, 100% {{ opacity: 1; transform: scale(1); }}
+        50%      {{ opacity: 0.55; transform: scale(0.9); }}
+    }}
+
+    /* ── Tabs ────────────────────────────────────────────────────────────── */
+    .stTabs [data-baseweb="tab-list"] {{
+        gap: 4px;
+        background: var(--surface);
+        padding: 6px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+    }}
+    .stTabs [data-baseweb="tab"] {{
+        background: transparent !important;
+        color: var(--text-2) !important;
+        border-radius: 6px !important;
+        padding: 8px 16px !important;
+        font-weight: 600 !important;
+        font-size: 0.85rem !important;
+        border: none !important;
+    }}
+    .stTabs [aria-selected="true"] {{
+        background: var(--surface-2) !important;
+        color: var(--text-1) !important;
+    }}
+
+    /* ── Expanders ───────────────────────────────────────────────────────── */
+    [data-testid="stExpander"] {{
+        background: var(--surface) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 10px !important;
+    }}
+    [data-testid="stExpander"] summary {{
+        color: var(--text-1) !important;
+        font-weight: 600 !important;
+    }}
+
+    /* ── Sidebar (collapsed by default; when expanded gets NEXUS treatment) ─ */
+    [data-testid="stSidebar"] {{
+        background: var(--surface) !important;
+        border-right: 1px solid var(--border);
+    }}
+    [data-testid="stSidebar"] * {{ color: var(--text-1); }}
+
+    /* ── Alerts (success/info/warning/error) ─────────────────────────────── */
+    [data-testid="stAlert"] {{
+        border-radius: 10px !important;
+        border: 1px solid var(--border) !important;
+        background: var(--surface) !important;
+    }}
+    [data-testid="stAlert"] * {{ color: var(--text-1) !important; }}
+
+    /* Radio (horizontal nav uses this) */
+    .stRadio [role="radiogroup"] label {{
+        background: var(--surface-2) !important;
+        color: var(--text-1) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 8px;
+        padding: 6px 14px;
+        margin-right: 6px;
+        font-weight: 600;
+        font-size: 0.85rem;
+    }}
+    .stRadio [role="radiogroup"] label:has(input:checked) {{
+        background: linear-gradient(135deg, var(--primary), var(--accent)) !important;
+        border-color: transparent !important;
+        color: #FFFFFF !important;
+    }}
+    .stRadio [role="radiogroup"] label:has(input:checked) * {{ color: #FFFFFF !important; }}
+
+    /* File uploader */
+    [data-testid="stFileUploader"] section {{
+        background: var(--surface) !important;
+        border: 1px dashed var(--border) !important;
+        border-radius: 10px;
+    }}
+    [data-testid="stFileUploader"] section * {{ color: var(--text-1) !important; }}
+
+    /* Checkbox squares */
+    .stCheckbox [data-baseweb="checkbox"] {{ color: var(--text-1) !important; }}
+
+    /* ── Dataframe ───────────────────────────────────────────────────────── */
+    [data-testid="stDataFrame"] {{
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+    }}
+
+    /* ── Browser screenshot frame ────────────────────────────────────────── */
+    .browser-view {{
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        background: var(--bg-elev);
+        padding: 6px;
+    }}
+
+    /* ── Misc cleanup ────────────────────────────────────────────────────── */
+    hr, [data-testid="stDivider"] {{
+        border-color: var(--border) !important;
+        background: var(--border) !important;
+        opacity: 0.6;
+    }}
+    .top-nav, .bottom-nav, .nav-button {{ display: none !important; }}  /* old nav hidden */
+    .extraction-meta  {{ color: var(--text-2); font-size: 0.82rem; }}
+    .extraction-detail {{
         font-size: 0.78rem;
-        color: #475569;
+        color: var(--text-2);
         margin: -4px 0 10px 0;
         padding-left: 19px;
-        max-width: 100%;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
-    }
+    }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -948,21 +1344,29 @@ def _search_provider_help() -> str:
 
 # ─── Sidebar ───────────────────────────────────────────────────────────────────
 def render_sidebar():
-    """Render sidebar with app info and stats"""
+    """NEXUS sidebar — collapsed by default. Shows deeper details when user expands it."""
     with st.sidebar:
-        st.markdown(f"## 🎯 {APP_NAME}")
-        st.caption(f"v{APP_VERSION}")
+        st.markdown(
+            f"""<div class="nexus-brand" style="margin-bottom:8px;">
+                <span class="nexus-glyph" style="font-size:1.3rem;">{BRAND_GLYPH}</span>
+                <div style="display:flex; flex-direction:column; line-height:1;">
+                    <span class="nexus-brand-name">{BRAND_SHORT}</span>
+                    <span class="nexus-brand-tag">v{APP_VERSION}</span>
+                </div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
         st.divider()
 
         # Show license status (from activation_ui)
         show_license_status()
-        
+
         # Show user info if available
         if st.session_state.get("user"):
             user = st.session_state.user
             st.caption(f"User: {user.get('username', 'Unknown')}")
             st.caption(f"Plan: {user.get('plan', 'Unknown').upper()}")
-        
+
         st.divider()
 
         st.markdown("### Engine")
@@ -1017,23 +1421,64 @@ NAV_OPTIONS = ["🔍 Live Extractor", "📋 Saved Leads", "⚙️ Settings"]
 
 
 def render_bottom_navigation():
-    """Top nav: Streamlit 1.40+ uses st.rerun (not experimental_rerun). Radio key drives current_page."""
-    st.markdown('<div class="top-nav"></div>', unsafe_allow_html=True)
+    """
+    NEXUS top status strip: brand + nav + status chips + theme toggle.
+    (Function name kept for backward compatibility with main() call site.)
+    """
+    # Status chips data
+    is_connected = bool(st.session_state.get("websocket_connected"))
+    is_running = bool(st.session_state.get("is_running"))
+    user = st.session_state.get("user") or {}
+    plan = (user.get("plan") or "FREE").upper()
+    try:
+        stats = get_lead_stats()
+        total_leads = int(stats.get("total_leads", 0))
+    except Exception:
+        total_leads = 0
 
-    if "top_nav_radio" not in st.session_state:
-        init = st.session_state.get("current_page")
-        st.session_state.top_nav_radio = init if init in NAV_OPTIONS else NAV_OPTIONS[0]
-    if st.session_state.top_nav_radio not in NAV_OPTIONS:
-        st.session_state.top_nav_radio = NAV_OPTIONS[0]
+    server_dot = "live" if is_running else ("success" if is_connected else "danger")
+    server_lbl = "Running" if is_running else ("Connected" if is_connected else "Offline")
+    theme_icon = "☀" if st.session_state.theme == "dark" else "☾"
 
-    st.radio(
-        label="Navigation",
-        options=NAV_OPTIONS,
-        horizontal=True,
-        key="top_nav_radio",
-        label_visibility="collapsed",
-    )
-    st.session_state.current_page = st.session_state.top_nav_radio
+    # Brand + status chips (HTML strip — visual only)
+    st.markdown(f"""
+    <div class="nexus-topbar">
+      <div class="nexus-brand">
+        <span class="nexus-glyph">{BRAND_GLYPH}</span>
+        <div style="display:flex; flex-direction:column; line-height:1;">
+          <span class="nexus-brand-name">{BRAND_SHORT}</span>
+          <span class="nexus-brand-tag">{BRAND_TAGLINE}</span>
+        </div>
+      </div>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <span class="nexus-chip"><span class="nexus-chip-dot {server_dot}"></span>{server_lbl}</span>
+        <span class="nexus-chip">📧 {total_leads:,} leads</span>
+        <span class="nexus-chip">🔐 {plan}</span>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Nav radio + theme toggle row
+    nav_col, theme_col = st.columns([5, 1])
+    with nav_col:
+        if "top_nav_radio" not in st.session_state:
+            init = st.session_state.get("current_page")
+            st.session_state.top_nav_radio = init if init in NAV_OPTIONS else NAV_OPTIONS[0]
+        if st.session_state.top_nav_radio not in NAV_OPTIONS:
+            st.session_state.top_nav_radio = NAV_OPTIONS[0]
+        st.radio(
+            label="Navigation",
+            options=NAV_OPTIONS,
+            horizontal=True,
+            key="top_nav_radio",
+            label_visibility="collapsed",
+        )
+        st.session_state.current_page = st.session_state.top_nav_radio
+    with theme_col:
+        if st.button(f"{theme_icon}  Theme", key="nexus_theme_toggle", use_container_width=True,
+                     help="Toggle between NEXUS dark and ATLAS light"):
+            st.session_state.theme = "light" if st.session_state.theme == "dark" else "dark"
+            st.rerun()
 
 
 # ─── Main Extractor Page ─────────────────────────────────────────────────────
@@ -1044,7 +1489,7 @@ def render_extractor_page():
 
     st.markdown('<p class="app-title">Live Extraction</p>', unsafe_allow_html=True)
     st.markdown(
-        '<p class="app-subtitle">Build queries from three lists — runs all combinations automatically until complete.</p>',
+        '<p class="app-subtitle">Build a query matrix from three lists. NEXUS runs every combination automatically and harvests leads in real time.</p>',
         unsafe_allow_html=True,
     )
 
@@ -1387,7 +1832,11 @@ def render_extractor_page():
 
 # ─── Saved Leads Page ───────────────────────────────────────────────────────
 def render_saved_leads_page():
-    st.markdown('<p class="app-title">📋 Saved Leads</p>', unsafe_allow_html=True)
+    st.markdown('<p class="app-title">Leads</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p class="app-subtitle">Validate, merge, and export every lead NEXUS has collected — plus any external lists you upload.</p>',
+        unsafe_allow_html=True,
+    )
 
     tab_extracted, tab_upload = st.tabs(["📥 Extracted Leads", "📤 Upload & Validate External Leads"])
 
@@ -1830,8 +2279,8 @@ def render_saved_leads_page():
 # ─── Settings Page ────────────────────────────────────────────────────────────
 def render_settings_page():
     """Render settings page"""
-    st.markdown('<p class="app-title">⚙️ Settings</p>', unsafe_allow_html=True)
-    st.markdown('<p class="app-subtitle">Configure application settings</p>', unsafe_allow_html=True)
+    st.markdown('<p class="app-title">Settings</p>', unsafe_allow_html=True)
+    st.markdown('<p class="app-subtitle">Search engine, pacing, and runtime preferences.</p>', unsafe_allow_html=True)
 
     st.markdown("### Search provider")
     search_engine = st.selectbox(
