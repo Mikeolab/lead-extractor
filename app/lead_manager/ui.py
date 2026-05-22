@@ -20,6 +20,7 @@ from app.lead_manager.domain_filter import (
 )
 from app.lead_manager.validator import validate_email
 from app.export.exporter import export_to_csv, export_to_excel
+from app.utils.download_ui import download_button_with_fallback
 
 
 def render_lead_manager_page():
@@ -183,8 +184,8 @@ def render_lead_manager_page():
             with col_d1:
                 if st.button("📥 Export as CSV", key="export_csv_ext"):
                     csv_bytes = export_to_csv(leads, filename="external_leads.csv")
-                    st.download_button(
-                        label="Download CSV",
+                    download_button_with_fallback(
+                        label="⬇️ Download CSV",
                         data=csv_bytes,
                         file_name="external_leads.csv",
                         mime="text/csv"
@@ -193,8 +194,8 @@ def render_lead_manager_page():
             with col_d2:
                 if st.button("📊 Export as Excel", key="export_excel_ext"):
                     excel_bytes = export_to_excel(leads, filename="external_leads.xlsx")
-                    st.download_button(
-                        label="Download Excel",
+                    download_button_with_fallback(
+                        label="⬇️ Download Excel",
                         data=excel_bytes,
                         file_name="external_leads.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -366,8 +367,8 @@ def render_lead_manager_page():
                         # Export duplicates
                         if st.button("📥 Export Duplicates", key="export_dup"):
                             csv_bytes = export_to_csv(duplicates, filename="duplicates.csv")
-                            st.download_button(
-                                label="Download Duplicates CSV",
+                            download_button_with_fallback(
+                                label="⬇️ Download Duplicates CSV",
                                 data=csv_bytes,
                                 file_name="duplicates.csv",
                                 mime="text/csv"
