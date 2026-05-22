@@ -66,8 +66,15 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 
-# License secret (used for HMAC signing - keep this safe)
-LICENSE_SECRET = "lead-extractor-pro-2026-secret-key"
+# License secret — XOR-obfuscated so it is not a plain string in the binary.
+# Do NOT reconstruct this by hand; changes here invalidate all issued keys.
+_K = 0x5A
+_S = bytes([
+    0x36,0x3f,0x3b,0x3e,0x77,0x3f,0x22,0x2e,0x28,0x3b,0x39,0x2e,
+    0x35,0x28,0x77,0x2a,0x28,0x35,0x77,0x68,0x6a,0x68,0x6c,0x77,
+    0x29,0x3f,0x39,0x28,0x3f,0x2e,0x77,0x31,0x3f,0x23,
+])
+LICENSE_SECRET = "".join(chr(b ^ _K) for b in _S)
 
 # WebSocket / API URL for automation server (for cloud deployment)
 # Set AUTOMATION_SERVER_URL env (e.g. https://your-api.onrender.com) or leave default for localhost

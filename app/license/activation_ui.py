@@ -138,80 +138,89 @@ def show_activation_dialog() -> bool:
 
 def check_license() -> Tuple[bool, Optional[Dict]]:
     """
-    Check if valid license exists.
-    
-    Returns:
-        Tuple of (is_valid, user_dict)
+    Check if a valid, machine-bound license exists.
+
+    Enforcement order:
+      1. Session-state cache (fast path) — re-validates HMAC + machine ID every call.
+      2. Database record — always checks both the HMAC and the machine_id column
+         that was written at activation time.
+
+    A license without a machine_id in its JWT payload is still accepted ONLY if
+    the machine_id stored in the DB at activation matches this machine.
+    There is no "backward compatibility" bypass — machine binding is always required.
     """
-    # Check session state first
-    if st.session_state.get("license_valid") and st.session_state.get("license_key"):
-        license_key = st.session_state.license_key
-        
-        # Quick validation
-        license_info = validate_license(license_key, LICENSE_SECRET)
-        if license_info.valid:
-            # Check machine ID
-            current_machine_id = get_machine_id()
-            from app.license.generator import decode_license_key
-            payload = decode_license_key(license_key)
-            
-            if payload and payload.get("machine_id"):
-                if payload["machine_id"] == current_machine_id:
-                    return True, st.session_state.get("user")
-            
-            # If no machine_id in payload, allow (backward compatibility)
-            if not payload or not payload.get("machine_id"):
-                return True, st.session_state.get("user")
-    
-    # Check database
+    current_machine_id = get_machine_id()
     from app.database.db import get_connection
+
+    # ── Ensure table exists ───────────────────────────────────────────────────
     conn = get_connection()
-    
-    # Ensure table exists
     conn.execute("""
         CREATE TABLE IF NOT EXISTS app_license (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key TEXT UNIQUE,
-            machine_id TEXT,
+            machine_id TEXT NOT NULL DEFAULT '',
             activated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             is_active BOOLEAN DEFAULT 1
         )
     """)
-    
+    conn.commit()
+    conn.close()
+
+    # ── Session-state fast path ───────────────────────────────────────────────
+    if st.session_state.get("license_valid") and st.session_state.get("license_key"):
+        license_key = st.session_state.license_key
+        license_info = validate_license(license_key, LICENSE_SECRET)
+        if license_info.valid:
+            # Always verify the machine ID stored at activation time
+            bound_mid = st.session_state.get("_bound_machine_id", "")
+            if bound_mid and bound_mid.lower() != current_machine_id.lower():
+                # Machine changed or license shared to a different PC — block it
+                st.session_state.license_valid = False
+                st.session_state.license_key = None
+                return False, None
+            if bound_mid:
+                return True, st.session_state.get("user")
+            # bound_mid not yet in session — fall through to DB to load it
+
+    # ── Database check ────────────────────────────────────────────────────────
+    conn = get_connection()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT license_key FROM app_license WHERE is_active = 1 ORDER BY activated_at DESC LIMIT 1"
+        "SELECT license_key, machine_id FROM app_license WHERE is_active = 1 ORDER BY activated_at DESC LIMIT 1"
     )
     row = cursor.fetchone()
     conn.close()
-    
-    if row:
-        license_key = row[0]
-        
-        # Validate
-        license_info = validate_license(license_key, LICENSE_SECRET)
-        if license_info.valid:
-            # Check machine ID
-            current_machine_id = get_machine_id()
-            from app.license.generator import decode_license_key
-            payload = decode_license_key(license_key)
-            
-            if payload and payload.get("machine_id"):
-                if payload["machine_id"] != current_machine_id:
-                    return False, None
-            
-            # Get or create user
-            user = user_manager.get_user_by_license(license_key)
-            if not user:
-                user = user_manager.create_user_from_license(license_key)
-            
-            if user:
-                st.session_state.license_key = license_key
-                st.session_state.user = user
-                st.session_state.license_valid = True
-                return True, user
-    
-    return False, None
+
+    if not row:
+        return False, None
+
+    license_key, stored_machine_id = row[0], (row[1] or "")
+
+    # 1. HMAC signature + expiry
+    license_info = validate_license(license_key, LICENSE_SECRET)
+    if not license_info.valid:
+        return False, None
+
+    # 2. Machine binding — stored_machine_id is set at activation and is REQUIRED.
+    #    If it's empty (legacy record), block and force re-activation.
+    if not stored_machine_id:
+        return False, None
+    if stored_machine_id.lower() != current_machine_id.lower():
+        return False, None
+
+    # 3. Load / create the user record
+    user = user_manager.get_user_by_license(license_key)
+    if not user:
+        user = user_manager.create_user_from_license(license_key)
+    if not user:
+        return False, None
+
+    # Cache in session state (including the bound machine ID)
+    st.session_state.license_key = license_key
+    st.session_state.user = user
+    st.session_state.license_valid = True
+    st.session_state._bound_machine_id = stored_machine_id
+    return True, user
 
 
 def show_license_status():
