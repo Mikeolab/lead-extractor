@@ -632,6 +632,65 @@ st.markdown(f"""
         text-overflow: ellipsis;
         white-space: nowrap;
     }}
+
+    /* ── Button click feedback (instant visual response) ─────────────── */
+    .stApp .stButton > button:active,
+    .stApp .stDownloadButton > button:active {{
+        transform: scale(0.97) !important;
+        opacity: 0.85 !important;
+        transition: transform 0.05s ease, opacity 0.05s ease !important;
+    }}
+    .stApp .stButton > button[kind="primary"]:active {{
+        transform: scale(0.97) translateY(0) !important;
+        filter: brightness(0.92) !important;
+    }}
+
+    /* ── Spinner theming ─────────────────────────────────────────────── */
+    .stSpinner > div {{
+        border-top-color: var(--primary) !important;
+    }}
+    [data-testid="stSpinnerContainer"],
+    .stSpinner {{
+        color: var(--text-2) !important;
+    }}
+    [data-testid="stStatusWidget"] {{
+        background: var(--surface) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 8px !important;
+        color: var(--text-2) !important;
+    }}
+
+    /* ── Toast / notification styling ─────────────────────────────────── */
+    [data-testid="stToast"] {{
+        background: var(--surface) !important;
+        color: var(--text-1) !important;
+        border: 1px solid var(--border) !important;
+        border-radius: 10px !important;
+        box-shadow: var(--shadow-card) !important;
+    }}
+    [data-testid="stToast"] * {{
+        color: var(--text-1) !important;
+    }}
+
+    /* ── Smooth transitions for interactive elements ──────────────────── */
+    .stRadio [role="radiogroup"] label {{
+        transition: all 0.12s ease !important;
+        cursor: pointer;
+    }}
+    .stRadio [role="radiogroup"] label:hover {{
+        background: var(--surface-3) !important;
+        border-color: var(--primary-dim) !important;
+    }}
+    .stRadio [role="radiogroup"] label:active {{
+        transform: scale(0.97);
+    }}
+
+    /* ── Running / Streamlit rerun overlay ─────────────────────────────── */
+    [data-testid="stAppViewBlockContainer"][data-stale="true"] {{
+        opacity: 0.55;
+        pointer-events: none;
+        transition: opacity 0.15s ease;
+    }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1130,9 +1189,9 @@ def _live_automation_fragment():
             st.progress(min(1.0, q_idx / q_total))
         if st.session_state.extracted_leads:
             _dl_df = leads_to_dataframe(st.session_state.extracted_leads)
-            st.download_button(
+            download_button_with_fallback(
                 "⬇️ Download collected",
-                data=_dl_df.to_csv(index=False),
+                data=_dl_df.to_csv(index=False).encode(),
                 file_name="leads_in_progress.csv",
                 mime="text/csv",
                 key="dl_mid_run",
@@ -1304,23 +1363,21 @@ def _render_live_query_sessions_panel():
             key="live_sess_dl_csv",
         )
     with e2:
-        if st.button("📄 Save CSV to exports folder", key="live_sess_save_csv"):
-            with st.spinner("Saving CSV…"):
-                path = export_to_csv(
-                    export_leads,
-                    f"merged_live_{len(export_leads)}_leads.csv",
-                    columns=export_cols,
-                )
-            st.success(f"Saved: {path}")
+        if st.button("📄 Save CSV", key="live_sess_save_csv"):
+            path = export_to_csv(
+                export_leads,
+                f"merged_live_{len(export_leads)}_leads.csv",
+                columns=export_cols,
+            )
+            st.toast(f"Saved → {Path(str(path)).name}", icon="📄")
     with e3:
-        if st.button("📊 Save Excel to exports folder", key="live_sess_save_xlsx"):
-            with st.spinner("Saving Excel…"):
-                path = export_to_excel(
-                    export_leads,
-                    f"merged_live_{len(export_leads)}_leads.xlsx",
-                    columns=export_cols,
-                )
-            st.success(f"Saved: {path}")
+        if st.button("📊 Save Excel", key="live_sess_save_xlsx"):
+            path = export_to_excel(
+                export_leads,
+                f"merged_live_{len(export_leads)}_leads.xlsx",
+                columns=export_cols,
+            )
+            st.toast(f"Saved → {Path(str(path)).name}", icon="📊")
 
 
 # ─── License Check ───────────────────────────────────────────────────────────
@@ -1738,12 +1795,12 @@ def render_extractor_page():
                 st.progress(min(1.0, q_idx / q_total))
             if st.session_state.extracted_leads:
                 _dl_df = leads_to_dataframe(st.session_state.extracted_leads)
-                st.download_button(
+                download_button_with_fallback(
                     "⬇️ Download collected",
-                    data=_dl_df.to_csv(index=False),
+                    data=_dl_df.to_csv(index=False).encode(),
                     file_name="leads_in_progress.csv",
                     mime="text/csv",
-                    key="dl_mid_run",
+                    key="dl_mid_run_page",
                 )
 
     # ── Connection status bar ────────────────────────────────────────────────
@@ -1813,21 +1870,21 @@ def render_extractor_page():
             e1, e2, e3, e4 = st.columns(4)
             with e1:
                 if st.button("📄 CSV", use_container_width=True, key="exp_csv"):
-                    with st.spinner("Saving CSV…"):
-                        st.success(f"✅ {export_to_csv(leads_list, columns=export_cols)}")
+                    path = export_to_csv(leads_list, columns=export_cols)
+                    st.toast(f"Saved → {Path(str(path)).name}", icon="📄")
             with e2:
                 if st.button("📊 Excel", use_container_width=True, key="exp_xlsx"):
-                    with st.spinner("Saving Excel…"):
-                        st.success(f"✅ {export_to_excel(leads_list, columns=export_cols)}")
+                    path = export_to_excel(leads_list, columns=export_cols)
+                    st.toast(f"Saved → {Path(str(path)).name}", icon="📊")
             with e3:
                 if st.button("📕 PDF", use_container_width=True, key="exp_pdf"):
-                    with st.spinner("Generating PDF…"):
-                        st.success(f"✅ {export_to_pdf(leads_list, query='Batch Results')}")
+                    path = export_to_pdf(leads_list, query='Batch Results')
+                    st.toast(f"Saved → {Path(str(path)).name}", icon="📕")
             with e4:
-                st.download_button(
-                    "⬇️ Download", use_container_width=True,
-                    data=leads_to_dataframe(leads_list, columns=export_cols).to_csv(index=False),
-                    file_name="leads.csv", mime="text/csv",
+                download_button_with_fallback(
+                    "⬇️ Download",
+                    data=leads_to_dataframe(leads_list, columns=export_cols).to_csv(index=False).encode(),
+                    file_name="leads.csv", mime="text/csv", key="exp_dl_csv",
                 )
 
 
@@ -1958,21 +2015,19 @@ def render_saved_leads_page():
                 st.markdown("**Download merged:**")
                 e1, e2, e3 = st.columns(3)
                 with e1:
-                    st.download_button(
+                    download_button_with_fallback(
                         "⬇️ CSV", key="dl_merged_csv", mime="text/csv",
-                        data=leads_to_dataframe(export_leads, columns=COLUMN_PRESETS[preset]).to_csv(index=False),
+                        data=leads_to_dataframe(export_leads, columns=COLUMN_PRESETS[preset]).to_csv(index=False).encode(),
                         file_name="merged_leads.csv",
                     )
                 with e2:
                     if st.button("📄 Save CSV", key="save_merged_csv"):
-                        with st.spinner("Saving CSV…"):
-                            result = export_to_csv(export_leads, f'merged_{len(export_leads)}_leads.csv', columns=COLUMN_PRESETS[preset])
-                        st.success(f"✅ {result}")
+                        p = export_to_csv(export_leads, f'merged_{len(export_leads)}_leads.csv', columns=COLUMN_PRESETS[preset])
+                        st.toast(f"Saved → {Path(str(p)).name}", icon="📄")
                 with e3:
                     if st.button("📊 Save Excel", key="save_merged_xlsx"):
-                        with st.spinner("Saving Excel…"):
-                            result = export_to_excel(export_leads, f'merged_{len(export_leads)}_leads.xlsx', columns=COLUMN_PRESETS[preset])
-                        st.success(f"✅ {result}")
+                        p = export_to_excel(export_leads, f'merged_{len(export_leads)}_leads.xlsx', columns=COLUMN_PRESETS[preset])
+                        st.toast(f"Saved → {Path(str(p)).name}", icon="📊")
 
                 # ── Validate merged leads ─────────────────────────────────────
                 st.divider()
@@ -2033,17 +2088,17 @@ def render_saved_leads_page():
                             })
                         col1, col2, col3 = st.columns(3)
                         with col1:
-                            st.download_button("⬇️ CSV", key=f"dl_{search_id}", mime="text/csv",
-                                data=leads_to_dataframe(leads, columns=single_cols).to_csv(index=False),
+                            download_button_with_fallback("⬇️ CSV", key=f"dl_{search_id}", mime="text/csv",
+                                data=leads_to_dataframe(leads, columns=single_cols).to_csv(index=False).encode(),
                                 file_name=f"session_{search_id}.csv")
                         with col2:
                             if st.button("📄 Save CSV", key=f"csv_{search_id}"):
-                                with st.spinner("Saving CSV…"):
-                                    st.success(f"✅ {export_to_csv(leads, f'session_{search_id}', columns=single_cols)}")
+                                p = export_to_csv(leads, f'session_{search_id}', columns=single_cols)
+                                st.toast(f"Saved → {Path(str(p)).name}", icon="📄")
                         with col3:
                             if st.button("📊 Save Excel", key=f"xlsx_{search_id}"):
-                                with st.spinner("Saving Excel…"):
-                                    st.success(f"✅ {export_to_excel(leads, f'session_{search_id}', columns=single_cols)}")
+                                p = export_to_excel(leads, f'session_{search_id}', columns=single_cols)
+                                st.toast(f"Saved → {Path(str(p)).name}", icon="📊")
                     else:
                         st.caption("No leads found for this session.")
 
@@ -2267,8 +2322,8 @@ def render_saved_leads_page():
 
         # ── Export (entire filtered set) ───────────────────────────────────────
         if match_total:
-            dl_data = pd.DataFrame(_all).to_csv(index=False) if _all else ""
-            st.download_button(
+            dl_data = (pd.DataFrame(_all).to_csv(index=False) if _all else "").encode()
+            download_button_with_fallback(
                 f"⬇️ Download all filtered ({match_total:,} leads)", key="ul_dl_csv",
                 data=dl_data, mime="text/csv",
                 file_name=f"external_leads{'_' + domain_filter_input if domain_filter_input else ''}.csv",
@@ -2318,16 +2373,15 @@ def render_settings_page():
 
     # Save button
     if st.button("💾 Save Settings", type="primary", key="save_settings_btn"):
-        with st.spinner("Saving settings…"):
-            new_settings = dict(settings)
-            new_settings["search_engine"] = search_engine
-            new_settings["max_pages"] = max_pages
-            new_settings["delay_pages"] = delay_pages
-            new_settings["delay_actions"] = delay_actions
-            new_settings["headless"] = headless
-            save_settings(new_settings)
-            st.session_state.settings = load_settings()
-        st.success("Settings saved successfully.")
+        new_settings = dict(settings)
+        new_settings["search_engine"] = search_engine
+        new_settings["max_pages"] = max_pages
+        new_settings["delay_pages"] = delay_pages
+        new_settings["delay_actions"] = delay_actions
+        new_settings["headless"] = headless
+        save_settings(new_settings)
+        st.session_state.settings = load_settings()
+        st.toast("Settings saved", icon="✅")
         st.rerun()
 
     st.divider()
@@ -2340,8 +2394,7 @@ def main():
     # show_activation_dialog() renders the full activation UI and returns True
     # only after the user successfully enters and saves a valid key.
     # st.stop() prevents any app content from rendering below.
-    with st.spinner("Checking license…"):
-        is_valid, user = check_license()
+    is_valid, user = check_license()
 
     if not is_valid:
         show_activation_dialog()

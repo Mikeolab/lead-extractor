@@ -1,9 +1,14 @@
 """
 Export Module
 Exports leads to CSV and Excel formats.
+
+In standalone (frozen) mode, exported files land in ~/Downloads so the user
+can find them easily.  In development mode they go to the project's exports/
+directory as before.
 """
 from __future__ import annotations
 import re
+import sys
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
@@ -12,7 +17,15 @@ from app.config import EXPORT_DIR
 
 
 def ensure_export_dir() -> Path:
-    """Ensure the export directory exists."""
+    """Return the directory where exported files should land, creating it if needed.
+
+    Standalone (frozen) builds: ~/Downloads  (user-visible).
+    Development:                EXPORT_DIR from config.py (project/exports/).
+    """
+    if getattr(sys, "frozen", False):
+        dl = Path.home() / "Downloads"
+        dl.mkdir(parents=True, exist_ok=True)
+        return dl
     EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     return EXPORT_DIR
 
