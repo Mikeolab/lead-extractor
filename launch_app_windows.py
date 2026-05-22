@@ -341,11 +341,24 @@ def start_fastapi_server(port: int) -> bool:
     """Start uvicorn on (127.0.0.1, port) in a daemon thread. Returns True once
     the port accepts connections, False on import/bind/startup failure."""
     try:
+        # Pre-configure logging to avoid formatter issues in frozen app
+        import logging
+        logging.getLogger("uvicorn").setLevel(logging.CRITICAL)
+        logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
+        logging.getLogger("uvicorn.error").setLevel(logging.CRITICAL)
+        logging.getLogger("fastapi").setLevel(logging.CRITICAL)
+        
         import uvicorn
         from app.server.automation_server import app as fastapi_app
 
         config = uvicorn.Config(
-            fastapi_app, host="127.0.0.1", port=port, log_level="error"
+            fastapi_app,
+            host="127.0.0.1",
+            port=port,
+            log_level="critical",  # Only log critical errors
+            log_config=None,  # Disable uvicorn's logging config (fixes frozen app formatter issue)
+            use_colors=False,  # Disable ANSI colors (no terminal in frozen app)
+            access_log=False,  # Disable access logging
         )
         server = uvicorn.Server(config)
 
