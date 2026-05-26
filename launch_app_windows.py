@@ -512,9 +512,9 @@ def open_in_webview(url: str, title: str) -> bool:
         webview.create_window(
             title,
             url,
-            width=1280,
-            height=860,
-            min_size=(960, 640),
+            width=1050,
+            height=720,
+            min_size=(800, 560),
             confirm_close=False,
         )
         webview.start()

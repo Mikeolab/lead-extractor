@@ -141,10 +141,16 @@ else:
     _btn_text   = "#F1F5F9"
     _btn_border = "#2E2E50"
 
+# Non-blocking font load — injected once via <link> (never use @import inside <style>, it blocks rendering)
+st.markdown(
+    '<link rel="preconnect" href="https://fonts.googleapis.com">'
+    '<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+    '<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800'
+    '&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">',
+    unsafe_allow_html=True,
+)
 st.markdown(f"""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
-
     /* ── Active theme tokens (swapped via session_state.theme) ───────────── */
     :root, html, body, .stApp {{
         {_theme_vars}
@@ -695,6 +701,22 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 
+# ─── Cached helpers (avoid hitting DB / server on every single rerun) ────────
+_stats_cache: dict = {"ts": 0.0, "data": {}}
+
+
+def _get_lead_stats_cached(ttl: float = 15.0) -> dict:
+    """Return get_lead_stats() results, re-fetching at most every *ttl* seconds."""
+    now = time.time()
+    if now - _stats_cache["ts"] > ttl:
+        try:
+            _stats_cache["data"] = get_lead_stats()
+        except Exception:
+            _stats_cache["data"] = {}
+        _stats_cache["ts"] = now
+    return _stats_cache["data"]
+
+
 # ─── Session State ───────────────────────────────────────────────────────────
 if "activity_log" not in st.session_state:
     st.session_state.activity_log = []
@@ -978,6 +1000,7 @@ def websocket_client(
             "reload_between_queries": batch_reload,
             "email_domain_allowlist": email_domain_allowlist,
             "search_site_domains": search_site_domains,
+            "send_screenshots": False,  # No live browser view — saves ~1MB/s bandwidth
         }))
 
     try:
@@ -1043,16 +1066,8 @@ def drain_ws_queue(msg_queue: Queue) -> bool:
             if len(st.session_state.activity_log) > 200:
                 st.session_state.activity_log = st.session_state.activity_log[-200:]
             changed = True
-        elif msg_type == "screenshot" and data:
-            if not hasattr(st.session_state, 'last_screenshot_update'):
-                st.session_state.last_screenshot_update = 0
-            now = time.time()
-            if (now - st.session_state.last_screenshot_update) >= 0.5:  # Update every 0.5s for responsive Live View
-                st.session_state.current_screenshot = data
-                st.session_state.last_screenshot_update = now
-                st.session_state.needs_refresh = True
-                st.session_state.last_update = now
-                changed = True
+        elif msg_type == "screenshot":
+            pass  # Screenshots disabled — saves ~1MB/tick bandwidth on RDP
         elif msg_type == "leads":
             # Only update lead buffers while a run is actively in progress.
             # If stop was already clicked, discard stale in-flight messages so
@@ -1103,8 +1118,26 @@ def drain_ws_queue(msg_queue: Queue) -> bool:
             changed = True
         elif msg_type == "closed":
             st.session_state.websocket_connected = False
-            st.session_state.is_running = False
-            st.session_state._terminal_rerun = True
+            # DON'T blindly set is_running=False — on RDP the WebSocket drops
+            # from network blips but the server-side task keeps extracting.
+            # Check if the server is still alive before declaring failure.
+            if st.session_state.get("is_running"):
+                _server_alive = False
+                try:
+                    import httpx
+                    _r = httpx.get(f"{AUTOMATION_SERVER_URL.rstrip('/')}/", timeout=2)
+                    _server_alive = _r.status_code == 200
+                except Exception:
+                    pass
+                if _server_alive:
+                    st.session_state.activity_log.append(
+                        "⚠️ Connection lost but server is still running. "
+                        "Leads are being saved to DB. Refresh the page to reconnect."
+                    )
+                else:
+                    st.session_state.is_running = False
+                    st.session_state.activity_log.append("❌ Server connection lost.")
+                    st.session_state._terminal_rerun = True
             changed = True
     return changed
 
@@ -1120,7 +1153,7 @@ def _escape_html(s: str) -> str:
 
 
 def _render_live_panel_content(*, extracting: bool):
-    """Browser screenshot + activity log + optional extraction banner."""
+    """Lightweight activity log — no heavy base64 screenshot rendering."""
     if extracting:
         n = len(st.session_state.get("extracted_leads", []))
         last = ""
@@ -1141,24 +1174,12 @@ def _render_live_panel_content(*, extracting: bool):
                 unsafe_allow_html=True,
             )
 
-    col_browser, col_log = st.columns([1.2, 0.8])
-    with col_browser:
-        st.markdown("### 🖥️ Live Browser View")
-        if st.session_state.current_screenshot:
-            st.image(
-                f"data:image/png;base64,{st.session_state.current_screenshot}",
-                use_container_width=True,
-                caption="Live browser automation",
-            )
-        else:
-            st.info("👆 Click **Start** to see live browser automation…")
-    with col_log:
-        st.markdown("### 📋 Activity Log")
-        log_text = "\n".join(st.session_state.activity_log[-50:])
-        st.markdown(f'<div class="activity-log">{_escape_html(log_text)}</div>', unsafe_allow_html=True)
+    st.markdown("### 📋 Activity Log")
+    log_text = "\n".join(st.session_state.activity_log[-50:])
+    st.markdown(f'<div class="activity-log">{_escape_html(log_text)}</div>', unsafe_allow_html=True)
 
 
-@st.fragment(run_every=timedelta(seconds=1.15))
+@st.fragment(run_every=timedelta(seconds=3))
 def _live_automation_fragment():
     """Refresh only this block while automation runs — avoids full-page Streamlit flashes."""
     q = st.session_state.get("ws_message_queue")
@@ -1441,18 +1462,18 @@ def render_sidebar():
         st.session_state.search_engine = search_engine
         if search_engine == "google":
             st.caption("Alternative provider may request verification after heavy use.")
-        # Check server status
+        # Server status — checked lazily (never blocks initial render)
         if not st.session_state.server_checked:
+            st.caption("🔄 Checking server…")
+            # Fire a quick non-blocking check the NEXT rerun (avoids 2s timeout on first paint)
+            st.session_state.server_checked = True  # mark so we only try once
             try:
                 import httpx
-                resp = httpx.get(f"{AUTOMATION_SERVER_URL.rstrip('/')}/", timeout=2)
-                if resp.status_code == 200:
-                    st.session_state.websocket_connected = True
-                st.session_state.server_checked = True
+                resp = httpx.get(f"{AUTOMATION_SERVER_URL.rstrip('/')}/", timeout=1.5)
+                st.session_state.websocket_connected = resp.status_code == 200
             except Exception:
                 st.session_state.websocket_connected = False
-                st.session_state.server_checked = True
-        
+
         if st.session_state.websocket_connected:
             st.success("✅ Server Connected")
         else:
@@ -1462,7 +1483,7 @@ def render_sidebar():
 
         st.markdown("### 📊 Stats")
         try:
-            stats = get_lead_stats()
+            stats = _get_lead_stats_cached()
             st.metric("Searches", stats["total_searches"])
             st.metric("Leads", stats["total_leads"])
             st.metric("Emails", stats["unique_emails"])
@@ -1489,7 +1510,7 @@ def render_bottom_navigation():
     user = st.session_state.get("user") or {}
     plan = (user.get("plan") or "FREE").upper()
     try:
-        stats = get_lead_stats()
+        stats = _get_lead_stats_cached()
         total_leads = int(stats.get("total_leads", 0))
     except Exception:
         total_leads = 0
@@ -1541,7 +1562,6 @@ def render_bottom_navigation():
 
 # ─── Main Extractor Page ─────────────────────────────────────────────────────
 def render_extractor_page():
-    import platform, subprocess
     q = st.session_state.get("ws_message_queue")
     drain_ws_queue(q)
 
@@ -1808,25 +1828,7 @@ def render_extractor_page():
     status_text += " | ✅ Connected" if st.session_state.websocket_connected else " | ⚠️ Not Connected"
     st.markdown(f'<div class="status-bar">{status_text}</div>', unsafe_allow_html=True)
 
-    # ── Platform launch helpers ──────────────────────────────────────────────
-    proj = Path(__file__).resolve().parent.parent
-    if platform.system() == "Darwin":
-        if st.button("Launch in Terminal (visible browser)", key="launch_terminal"):
-            try:
-                cmd = f"cd {proj} && python3 launch_app_simple.py"
-                subprocess.run(["osascript", "-e", f'tell application "Terminal" to do script "{cmd}"'], check=False, timeout=5)
-                st.success("Terminal opened.")
-            except Exception as e:
-                st.error(f"Could not open Terminal: {e}")
-    elif platform.system() == "Windows":
-        if st.button("Launch in CMD (visible browser)", key="launch_cmd"):
-            try:
-                subprocess.Popen(["cmd", "/k", f'cd /d "{proj}" && python launch_app_windows.py'], cwd=str(proj), creationflags=subprocess.CREATE_NEW_CONSOLE if sys.platform == "win32" else 0)
-                st.success("Command Prompt opened.")
-            except Exception as e:
-                st.error(f"Could not open Command Prompt: {e}")
-
-    # ── Live Browser View + Activity Log ────────────────────────────────────
+    # ── Activity Log ──────────────────────────────────────────────────────────
     st.divider()
     if is_running:
         _live_automation_fragment()

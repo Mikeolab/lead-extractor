@@ -184,6 +184,7 @@ class AutomationManager:
         self.task = None  # asyncio Task for run_automation — stored so Stop can cancel it
         self.last_screenshot_time = 0
         self.screenshot_throttle = 1.0  # Max 1 screenshot per second
+        self.send_screenshots = True  # UI can disable to save bandwidth
         self.all_leads_buffer = []  # Buffer to save on disconnect
         self.current_session_id = None  # Track current search session
 
@@ -272,15 +273,18 @@ class AutomationManager:
             pass
 
     async def take_screenshot(self, force: bool = False) -> str:
-        """Take screenshot and return base64 string (throttled)."""
+        """Take screenshot and return base64 string (throttled).
+        Returns '' immediately when send_screenshots is False (saves CPU + bandwidth)."""
+        if not self.send_screenshots:
+            return ""
         if not self.page:
             return ""
-        
+
         # Throttle screenshots to prevent spam
         current_time = time.time()
         if not force and (current_time - self.last_screenshot_time) < self.screenshot_throttle:
             return ""
-        
+
         try:
             screenshot_bytes = await self.page.screenshot(full_page=False, timeout=5000)
             self.last_screenshot_time = current_time
@@ -2007,6 +2011,7 @@ async def websocket_endpoint(websocket: WebSocket):
                         search_engine = "duckduckgo"
                     headless = bool(data.get("headless", False))
                     reload_between_queries = bool(data.get("reload_between_queries", False))
+                    manager.send_screenshots = bool(data.get("send_screenshots", True))
 
                     # Run automation in background — store task so Stop can cancel it
                     manager.task = asyncio.create_task(manager.run_automation(
