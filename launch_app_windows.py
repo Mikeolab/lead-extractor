@@ -634,29 +634,10 @@ def main() -> None:
             release_lock(lock_fd)
             sys.exit(1)
 
-        # ── License pre-flight ───────────────────────────────────────────────
-        # Check BEFORE opening the window. On a fresh install (no DB yet) this
-        # returns True so the activation dialog inside Streamlit can handle it.
-        # On a machine where the license is missing or bound to a different PC,
-        # we show a native dialog and exit cleanly.
-        if not _preflight_license_check():
-            from app.license.machine_id import get_machine_id as _gmid
-            _mid = _gmid()
-            show_native_error(
-                "Lead Extractor Pro — License Required",
-                "No valid license found for this computer.\n\n"
-                f"Your Hardware ID:\n  {_mid}\n\n"
-                "Send this ID to your administrator to obtain a license key.\n"
-                "Then relaunch the application and enter the key when prompted.",
-            )
-            release_lock(lock_fd)
-            try:
-                proc.terminate()
-            except Exception:
-                pass
-            sys.exit(1)
-
         # ── Open the UI ─────────────────────────────────────────────────────
+        # License activation is handled entirely inside the Streamlit app.
+        # The in-app activation screen lets users enter their key on first run
+        # or on any new device. No launcher-level license gate needed.
         url = f"http://127.0.0.1:{ui_port}"
         if open_in_webview(url, title="Lead Extractor Pro"):
             # Native window closed cleanly → quit Streamlit and exit
