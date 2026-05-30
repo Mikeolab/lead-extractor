@@ -766,6 +766,19 @@ if "ext_validation_results" not in st.session_state:
     st.session_state.ext_validation_results = None
 if "extracted_validation_results" not in st.session_state:
     st.session_state.extracted_validation_results = None
+# Saved Leads page — DB/merge cache to prevent heavy reruns
+if "_saved_searches_cache" not in st.session_state:
+    st.session_state._saved_searches_cache = None   # list[dict] | None
+if "_saved_searches_ts" not in st.session_state:
+    st.session_state._saved_searches_ts = 0.0
+if "_merged_leads_cache" not in st.session_state:
+    st.session_state._merged_leads_cache = []       # cached merged list
+if "_merged_leads_ids_key" not in st.session_state:
+    st.session_state._merged_leads_ids_key = ""     # frozenset string for cache invalidation
+if "_validate_pending" not in st.session_state:
+    st.session_state._validate_pending = False      # True → next render runs validation
+if "_ext_validate_pending" not in st.session_state:
+    st.session_state._ext_validate_pending = False
 
 
 def _run_validation_with_progress(leads: list) -> dict:
@@ -778,12 +791,13 @@ def _run_validation_with_progress(leads: list) -> dict:
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from app.lead_manager.validator import _check_mx, validate_email as _vld
 
-    bar = st.progress(0, text="Phase 1/2: finding unique domains…")
+    # Show immediate feedback *before* the blocking DNS phase.
+    # The progress bar and status render right away so the user sees
+    # something within milliseconds of clicking Validate.
+    bar = st.progress(0, text="Starting validation…")
     status = st.empty()
 
     # Pre-filter: only leads that actually have an email address.
-    # Leads without emails are skipped but counting them in "total" would make
-    # the metrics misleading (valid + dup + invalid ≠ checked).
     leads_with_email = [l for l in leads if "@" in (l.get("email") or "")]
     no_email_count = len(leads) - len(leads_with_email)
     total = len(leads_with_email)
@@ -798,10 +812,13 @@ def _run_validation_with_progress(leads: list) -> dict:
             unique_domains.append(domain)
 
     n_domains = len(unique_domains)
+
+    # Update progress bar immediately so user has visible feedback
+    bar.progress(0.02, text=f"Phase 1/2 — checking {n_domains} mail server(s)…")
     status.caption(
         f"Found {n_domains} unique domain(s) across {total:,} leads"
         + (f" ({no_email_count:,} skipped — no email)" if no_email_count else "")
-        + " — checking mail servers…"
+        + " — DNS MX lookups in progress…"
     )
 
     # Phase 1: parallel MX lookups
@@ -812,8 +829,8 @@ def _run_validation_with_progress(leads: list) -> dict:
             for fut in as_completed(futures):
                 completed += 1
                 bar.progress(
-                    completed / n_domains * 0.5,
-                    text=f"Phase 1/2: checked {completed}/{n_domains} domains…",
+                    max(0.02, completed / n_domains * 0.5),
+                    text=f"Phase 1/2: checked {completed}/{n_domains} mail servers…",
                 )
 
     # Phase 2: validate each lead using cached MX results
@@ -881,26 +898,41 @@ def _render_validation_results(vr: dict, dl_key_prefix: str) -> None:
             f"After cleaning: **{vr['valid_count']:,} unique valid leads**."
         )
 
-    act1, act2 = st.columns(2)
-    with act1:
-        if vr["valid_leads_data"]:
-            vdf = pd.DataFrame(vr["valid_leads_data"])
-            vcols = [c for c in ["email", "domain", "contact_name", "business_name", "phone"] if c in vdf.columns]
+    if vr["valid_leads_data"]:
+        vdf = pd.DataFrame(vr["valid_leads_data"])
+        vcols_full = [c for c in ["email", "domain", "contact_name", "business_name", "phone"] if c in vdf.columns]
+
+        dl1, dl2, dl3 = st.columns(3)
+        with dl1:
+            # Emails only — single column, most common use case
             download_button_with_fallback(
-                f"⬇️ Download valid only ({vr['valid_count']:,})",
-                data=vdf[vcols].to_csv(index=False).encode(),
+                f"⬇️ Emails only ({vr['valid_count']:,})",
+                data=vdf[["email"]].to_csv(index=False).encode(),
+                file_name="leads_emails_only.csv",
+                mime="text/csv",
+                key=f"{dl_key_prefix}_dl_emails",
+                use_container_width=True,
+            )
+        with dl2:
+            # All columns for valid unique leads
+            download_button_with_fallback(
+                f"⬇️ Valid + all fields ({vr['valid_count']:,})",
+                data=vdf[vcols_full].to_csv(index=False).encode(),
                 file_name="leads_valid_unique.csv",
                 mime="text/csv",
                 key=f"{dl_key_prefix}_dl_valid",
+                use_container_width=True,
             )
-    with act2:
-        if vr["valid_leads_data"]:
+        with dl3:
+            # Raw export (every row, no filtering)
+            _raw_df = pd.DataFrame(vr["valid_leads_data"])
             download_button_with_fallback(
-                "⬇️ Download all (no filter)",
-                data=pd.DataFrame(vr["valid_leads_data"] + []).to_csv(index=False).encode(),
+                "⬇️ All rows (no filter)",
+                data=_raw_df.to_csv(index=False).encode(),
                 file_name="leads_all.csv",
                 mime="text/csv",
                 key=f"{dl_key_prefix}_dl_all",
+                use_container_width=True,
             )
 
 
@@ -1901,11 +1933,31 @@ def render_saved_leads_page():
     tab_extracted, tab_upload = st.tabs(["📥 Extracted Leads", "📤 Upload & Validate External Leads"])
 
     # ════════════════════════════════════════════════════════════════════════════
-    # TAB A — Extracted Leads (existing functionality, unchanged)
+    # TAB A — Extracted Leads
     # ════════════════════════════════════════════════════════════════════════════
     with tab_extracted:
         from app.database.db import get_recent_searches, get_leads_by_search
-        searches = get_recent_searches(limit=50)
+
+        # ── Cache recent searches (30 s TTL) — NOT re-fetched on every rerun ──
+        _now = time.time()
+        if (
+            st.session_state._saved_searches_cache is None
+            or _now - st.session_state._saved_searches_ts > 30
+        ):
+            st.session_state._saved_searches_cache = get_recent_searches(limit=50)
+            st.session_state._saved_searches_ts = _now
+        searches = st.session_state._saved_searches_cache
+
+        # Manual refresh button — top right
+        _refresh_col, _spacer = st.columns([1, 6])
+        with _refresh_col:
+            if st.button("🔄 Refresh", key="saved_refresh_sessions", help="Reload session list from DB"):
+                st.session_state._saved_searches_cache = None
+                st.session_state._saved_searches_ts = 0.0
+                # also clear merged cache so leads reload next time
+                st.session_state._merged_leads_cache = []
+                st.session_state._merged_leads_ids_key = ""
+                st.rerun()
 
         if not searches:
             st.info("No searches found. Run some queries first!")
@@ -1946,10 +1998,12 @@ def render_saved_leads_page():
             with c1:
                 if st.button("✅ Select All", key="saved_select_all"):
                     st.session_state.saved_leads_selected_ids = {s["id"] for s in searches}
+                    st.session_state._merged_leads_ids_key = ""  # bust cache
                     st.rerun()
             with c2:
                 if st.button("❌ Clear selection", key="saved_clear"):
                     st.session_state.saved_leads_selected_ids = set()
+                    st.session_state._merged_leads_ids_key = ""
                     st.rerun()
             with c3:
                 if st.button("📅 Today Only", key="saved_today"):
@@ -1957,15 +2011,22 @@ def render_saved_leads_page():
                     st.session_state.saved_leads_selected_ids = {
                         s["id"] for s in searches if str(s.get("created_at", "")).startswith(today)
                     }
+                    st.session_state._merged_leads_ids_key = ""
                     st.rerun()
 
             if st.session_state.saved_leads_selected_ids:
-                all_merged = []
-                for sid in st.session_state.saved_leads_selected_ids:
-                    for lead in get_leads_by_search(sid):
-                        lead_copy = dict(lead)
-                        lead_copy["_session_id"] = sid
-                        all_merged.append(lead_copy)
+                # ── Cached merge: only re-fetch when selected IDs change ──────
+                _current_ids_key = str(sorted(st.session_state.saved_leads_selected_ids))
+                if _current_ids_key != st.session_state._merged_leads_ids_key:
+                    _merged_tmp = []
+                    for sid in st.session_state.saved_leads_selected_ids:
+                        for lead in get_leads_by_search(sid):
+                            lead_copy = dict(lead)
+                            lead_copy["_session_id"] = sid
+                            _merged_tmp.append(lead_copy)
+                    st.session_state._merged_leads_cache = _merged_tmp
+                    st.session_state._merged_leads_ids_key = _current_ids_key
+                all_merged = st.session_state._merged_leads_cache
 
                 st.text_area(
                     "Optional: email domain filter before download (one per line)",
@@ -1981,54 +2042,84 @@ def render_saved_leads_page():
                 use_validation = "valid" in export_mode.lower()
                 _saved_dom = (st.session_state.get("saved_export_email_domains") or "").strip()
 
-                export_leads, ex_stats = filter_merged_leads_for_export(
-                    all_merged, use_full=use_full, use_validation=use_validation,
-                    email_domain_allowlist=_saved_dom if _saved_dom else None,
-                )
+                # ── Export leads: only computed when export/validate is triggered ──
+                # On normal reruns we show the count from the cache cheaply.
+                # filter_merged_leads_for_export is only called when something changes.
+                _export_cache_key = f"{_current_ids_key}|{export_mode}|{_saved_dom}"
+                if "_export_leads_cache" not in st.session_state:
+                    st.session_state._export_leads_cache = []
+                    st.session_state._export_ex_stats_cache = {}
+                    st.session_state._export_cache_key = ""
 
-                if use_full:
+                if _export_cache_key != st.session_state._export_cache_key:
+                    # Only "Full" and "Unique" modes are cheap — run them eagerly.
+                    # "Unique valid" (DNS-heavy) is expensive: show count from raw cache.
+                    if not use_validation:
+                        export_leads, ex_stats = filter_merged_leads_for_export(
+                            all_merged, use_full=use_full, use_validation=False,
+                            email_domain_allowlist=_saved_dom if _saved_dom else None,
+                        )
+                        st.session_state._export_leads_cache = export_leads
+                        st.session_state._export_ex_stats_cache = ex_stats
+                        st.session_state._export_cache_key = _export_cache_key
+                    else:
+                        # Don't run validation automatically — show a prompt to run it
+                        export_leads = st.session_state._export_leads_cache
+                        ex_stats = st.session_state._export_ex_stats_cache
+                else:
+                    export_leads = st.session_state._export_leads_cache
+                    ex_stats = st.session_state._export_ex_stats_cache
+
+                if use_validation and _export_cache_key != st.session_state._export_cache_key:
+                    st.info(
+                        f"📋 {len(all_merged):,} raw rows loaded. "
+                        "Click **Validate & Deduplicate** below to run dedup + DNS email validation."
+                    )
+                elif use_full:
                     _doms = ex_stats.get("domain_filtered_count", 0)
-                    _fmsg = f"📋 {len(export_leads)} leads (full, no dedup)"
+                    _fmsg = f"📋 {len(export_leads):,} leads (full, no dedup)"
                     if _doms:
                         _fmsg += f" — {_doms} row(s) removed by domain filter"
                     st.info(_fmsg)
-                else:
+                elif export_leads:
                     label = "unique valid" if use_validation else "unique"
                     st.success(
-                        f"✅ {len(export_leads)} {label} leads "
-                        f"(from {ex_stats['merged_raw']} rows → {ex_stats['rows_after_split']} after split)"
+                        f"✅ {len(export_leads):,} {label} leads "
+                        f"(from {ex_stats.get('merged_raw',0):,} rows → {ex_stats.get('rows_after_split',0):,} after split)"
                     )
                     with st.expander("📊 Breakdown"):
-                        st.markdown(f"- **No email:** {ex_stats['no_email_count']}")
+                        st.markdown(f"- **No email:** {ex_stats.get('no_email_count',0)}")
                         if use_validation:
-                            st.markdown(f"- **Invalid format:** {ex_stats['invalid_count']}")
-                        st.markdown(f"- **Duplicate:** {ex_stats['dup_count']}")
+                            st.markdown(f"- **Invalid format:** {ex_stats.get('invalid_count',0)}")
+                        st.markdown(f"- **Duplicate:** {ex_stats.get('dup_count',0)}")
                         if ex_stats.get("domain_filtered_count", 0):
                             st.markdown(f"- **Domain filter:** {ex_stats['domain_filtered_count']}")
 
                 preset = st.selectbox("Filter columns", list(COLUMN_PRESETS.keys()), key="saved_preset")
                 st.session_state.saved_leads_column_preset = preset
-                cols = [c for c in COLUMN_PRESETS[preset] if c in (export_leads[0].keys() if export_leads else [])] or list(COLUMN_PRESETS[preset])
-                df_merged = pd.DataFrame(export_leads)
+                _show_leads = export_leads if export_leads else all_merged
+                cols = [c for c in COLUMN_PRESETS[preset] if c in (_show_leads[0].keys() if _show_leads else [])] or list(COLUMN_PRESETS[preset])
+                df_merged = pd.DataFrame(_show_leads)
                 show_cols = [c for c in cols if c in df_merged.columns]
                 if not df_merged.empty:
                     st.dataframe(df_merged[show_cols] if show_cols else df_merged, use_container_width=True, hide_index=True)
 
                 st.markdown("**Download merged:**")
                 e1, e2, e3 = st.columns(3)
+                _dl_data = export_leads if export_leads else all_merged
                 with e1:
                     download_button_with_fallback(
                         "⬇️ CSV", key="dl_merged_csv", mime="text/csv",
-                        data=leads_to_dataframe(export_leads, columns=COLUMN_PRESETS[preset]).to_csv(index=False).encode(),
+                        data=leads_to_dataframe(_dl_data, columns=COLUMN_PRESETS[preset]).to_csv(index=False).encode(),
                         file_name="merged_leads.csv",
                     )
                 with e2:
                     if st.button("📄 Save CSV", key="save_merged_csv"):
-                        p = export_to_csv(export_leads, f'merged_{len(export_leads)}_leads.csv', columns=COLUMN_PRESETS[preset])
+                        p = export_to_csv(_dl_data, f'merged_{len(_dl_data)}_leads.csv', columns=COLUMN_PRESETS[preset])
                         st.toast(f"Saved → {Path(str(p)).name}", icon="📄")
                 with e3:
                     if st.button("📊 Save Excel", key="save_merged_xlsx"):
-                        p = export_to_excel(export_leads, f'merged_{len(export_leads)}_leads.xlsx', columns=COLUMN_PRESETS[preset])
+                        p = export_to_excel(_dl_data, f'merged_{len(_dl_data)}_leads.xlsx', columns=COLUMN_PRESETS[preset])
                         st.toast(f"Saved → {Path(str(p)).name}", icon="📊")
 
                 # ── Validate merged leads ─────────────────────────────────────
@@ -2036,11 +2127,28 @@ def render_saved_leads_page():
                 st.markdown("**Validate & deduplicate merged leads:**")
                 st.caption("DNS MX check per domain + dedup. Finds invalid emails and removes duplicates from DB.")
 
-                _val_placeholder = st.empty()  # Progress bar renders here
-                if st.button("✅ Validate & Deduplicate merged leads", key="ext_validate_btn"):
-                    if export_leads:
-                        with _val_placeholder.container():
-                            st.session_state.extracted_validation_results = _run_validation_with_progress(export_leads)
+                # Two-phase button: first click sets flag + reruns (instant feedback),
+                # second render sees flag and runs the heavy work.
+                if st.session_state._validate_pending:
+                    # This render was triggered by the button click → run validation now
+                    st.session_state._validate_pending = False
+                    _leads_to_validate = all_merged if use_validation else export_leads
+                    if _leads_to_validate:
+                        st.session_state.extracted_validation_results = _run_validation_with_progress(_leads_to_validate)
+                        # Cache results as "unique valid" export
+                        if use_validation:
+                            st.session_state._export_leads_cache = st.session_state.extracted_validation_results.get("valid_leads_data", [])
+                            st.session_state._export_cache_key = _export_cache_key
+                        st.rerun()
+                    else:
+                        st.warning("No leads to validate.")
+
+                _val_btn_label = "✅ Validate & Deduplicate merged leads"
+                if st.button(_val_btn_label, key="ext_validate_btn"):
+                    if all_merged:
+                        st.session_state._validate_pending = True
+                        st.session_state.extracted_validation_results = None
+                        st.toast("⏳ Starting validation…", icon="🔍")
                         st.rerun()
                     else:
                         st.warning("No leads to validate. Select at least one session above.")
@@ -2062,6 +2170,8 @@ def render_saved_leads_page():
                                 deleted = delete_leads_by_ids(ext_removable)
                             st.success(f"{deleted:,} rows removed from extracted leads DB.")
                             st.session_state.extracted_validation_results = None
+                            st.session_state._merged_leads_ids_key = ""  # bust merge cache
+                            st.session_state._export_cache_key = ""
                             st.rerun()
                     with ext_rb:
                         if st.button("✖ Clear results", key="ext_clear_vr"):
@@ -2077,8 +2187,16 @@ def render_saved_leads_page():
                 query = search["query"]
                 num_leads = search["num_leads"]
                 created_at = search["created_at"]
-                with st.expander(f"Session #{search_id}: {query[:60]}{'...' if len(query) > 60 else ''} ({num_leads} leads) — {created_at}"):
-                    leads = get_leads_by_search(search_id)
+                # Lazy-load: DB call only happens when the user opens the expander.
+                # We use a session_state dict to keep loaded leads across reruns.
+                if "_session_leads_loaded" not in st.session_state:
+                    st.session_state._session_leads_loaded = {}
+                exp_label = f"Session #{search_id}: {query[:60]}{'...' if len(query) > 60 else ''} ({num_leads} leads) — {created_at}"
+                with st.expander(exp_label):
+                    # Load on first open; cache thereafter
+                    if search_id not in st.session_state._session_leads_loaded:
+                        st.session_state._session_leads_loaded[search_id] = get_leads_by_search(search_id)
+                    leads = st.session_state._session_leads_loaded[search_id]
                     if leads:
                         df = pd.DataFrame(leads)
                         avail = [c for c in ["contact_name", "phone", "email"] if c in df.columns]
@@ -2154,6 +2272,9 @@ def render_saved_leads_page():
                                 if m:
                                     st.caption(m)
                             st.session_state.ext_leads_last_imported = saved_count
+                            # bust external leads cache so next render shows fresh data
+                            st.session_state._ul_all_cache = {}
+                            st.session_state._ul_all_ts = {}
                             st.rerun()
                     except Exception as ex:
                         st.error(f"Import failed: {ex}")
@@ -2202,13 +2323,28 @@ def render_saved_leads_page():
             page_size = st.selectbox(
                 "Leads per page", [50, 100, 200, 500], index=1, key="ul_page_size"
             )
-        with fc3:
-            # Total matching count for pagination
+
+        # ── Fetch total count + full list (cached 30 s) ───────────────────────
+        # Fetching 100 k rows every rerun kills perf. Cache by domain filter key.
+        _ul_cache_key = f"_ul_all_{(domain_filter_input or '').strip()}"
+        if "_ul_all_cache" not in st.session_state:
+            st.session_state._ul_all_cache = {}
+            st.session_state._ul_all_ts = {}
+        _ul_now = time.time()
+        if (
+            _ul_cache_key not in st.session_state._ul_all_cache
+            or _ul_now - st.session_state._ul_all_ts.get(_ul_cache_key, 0) > 30
+        ):
             try:
-                _all = get_external_leads(limit=100_000, domain_filter=domain_filter_input.strip() or None)
-                match_total = len(_all)
+                _all_tmp = get_external_leads(limit=100_000, domain_filter=domain_filter_input.strip() or None)
             except Exception:
-                match_total = 0
+                _all_tmp = []
+            st.session_state._ul_all_cache[_ul_cache_key] = _all_tmp
+            st.session_state._ul_all_ts[_ul_cache_key] = _ul_now
+        _all = st.session_state._ul_all_cache[_ul_cache_key]
+        match_total = len(_all)
+
+        with fc3:
             max_page = max(1, (match_total + page_size - 1) // page_size)
             page_num = st.number_input(
                 f"Page (1 – {max_page})",
@@ -2216,13 +2352,7 @@ def render_saved_leads_page():
             )
 
         offset = (page_num - 1) * page_size
-        try:
-            ext_leads = get_external_leads(
-                limit=page_size, offset=offset,
-                domain_filter=domain_filter_input.strip() or None,
-            )
-        except Exception:
-            ext_leads = []
+        ext_leads = _all[offset: offset + page_size]
 
         if match_total:
             first = offset + 1
@@ -2244,12 +2374,24 @@ def render_saved_leads_page():
         with btn_c3:
             clear_clicked = st.button("🗑️ Clear all external leads", key="ul_clear_all", type="secondary")
 
-        # ── Run validation with progress bar ─────────────────────────────────
-        if validate_all_clicked:
+        # ── Two-phase validation: button → set flag → rerun → validate ────────
+        if st.session_state._ext_validate_pending:
+            st.session_state._ext_validate_pending = False
             check_leads = _all if match_total else []
             if check_leads:
                 st.session_state.ext_validation_results = _run_validation_with_progress(check_leads)
+                # bust the cache after we (potentially) modify things
+                st.session_state._ul_all_cache.pop(_ul_cache_key, None)
                 st.rerun()
+
+        if validate_all_clicked:
+            if _all:
+                st.session_state._ext_validate_pending = True
+                st.session_state.ext_validation_results = None
+                st.toast("⏳ Starting validation…", icon="🔍")
+                st.rerun()
+            else:
+                st.warning("No leads to validate — upload a file first.")
 
         # ── Show persistent validation results ───────────────────────────────
         vr = st.session_state.ext_validation_results
@@ -2301,6 +2443,7 @@ def render_saved_leads_page():
                         deleted, _ = delete_external_leads(all_ids)
                     st.success(f"Deleted {deleted} external lead(s).")
                     st.session_state.ext_validation_results = None
+                    st.session_state._ul_all_cache.pop(_ul_cache_key, None)  # bust cache
                     st.rerun()
             except Exception as ex:
                 st.error(f"Delete failed: {ex}")
