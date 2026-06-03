@@ -5,7 +5,7 @@ name: Build Windows EXE
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'release/**']
   workflow_dispatch:
 
 jobs:

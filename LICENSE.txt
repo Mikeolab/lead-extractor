@@ -1,0 +1,148 @@
+═══════════════════════════════════════════════════════════════════
+  END USER LICENSE AGREEMENT (EULA)
+  Build With AI — Single-User Personal License
+═══════════════════════════════════════════════════════════════════
+
+By downloading, installing, or using this software (the "Product"), you
+("Licensee", "You") agree to be legally bound by the terms below.
+
+If you do not agree, delete the Product immediately and request a refund
+within 14 days of purchase.
+
+───────────────────────────────────────────────────────────────────
+  1. GRANT OF LICENSE
+───────────────────────────────────────────────────────────────────
+
+Build With AI ("Licensor", "We") grants you a non-exclusive, non-transferable,
+non-sublicensable, perpetual license to:
+
+  ✓ Install and use the Product on machines YOU personally own
+  ✓ Use the Product for your own personal or business activities
+  ✓ Make backup copies for personal use only
+  ✓ Modify the source code for your own use (Python apps only)
+
+This license is bound to YOU as a single buyer. License keys (where
+applicable) are tied to your email address and may be tied to specific
+machines via hardware ID.
+
+───────────────────────────────────────────────────────────────────
+  2. RESTRICTIONS (WHAT YOU CANNOT DO)
+───────────────────────────────────────────────────────────────────
+
+You may NOT:
+
+  ✗ Resell, redistribute, sublicense, rent, lease, or transfer the Product
+    to any other person or entity
+  ✗ Share license keys, ZIP files, or source code with others
+  ✗ Upload the Product to any public repository, forum, or torrent site
+  ✗ Offer the Product as a SaaS, hosted service, or commercial product
+    to third parties (without a separate commercial license from us)
+  ✗ Remove or alter any copyright, trademark, or attribution notices
+  ✗ Use the Product for any illegal purpose or in violation of platform
+    Terms of Service (e.g., scraping platforms that prohibit it)
+  ✗ Reverse-engineer license key generation or activation systems
+
+Each license is for ONE individual buyer. Teams, agencies, or
+organizations require separate licenses per user (contact us for
+volume pricing).
+
+───────────────────────────────────────────────────────────────────
+  3. WHAT YOU GET
+───────────────────────────────────────────────────────────────────
+
+  ✓ Full Product source code or compiled binaries (as delivered)
+  ✓ Installation guide and documentation
+  ✓ Free lifetime updates (delivered to the email you purchased with)
+  ✓ Email support — replies within 24 hours on business days
+  ✓ Bug fixes and improvements as released
+
+───────────────────────────────────────────────────────────────────
+  4. OWNERSHIP
+───────────────────────────────────────────────────────────────────
+
+The Product is licensed, NOT sold. Build With AI retains all rights,
+title, and interest in the Product, including all intellectual
+property rights. You own only the right to use the Product as defined
+in this License.
+
+───────────────────────────────────────────────────────────────────
+  5. THIRD-PARTY SERVICES
+───────────────────────────────────────────────────────────────────
+
+The Product may require third-party services (e.g., Groq, OpenAI,
+Playwright) which have their own terms of service and may charge fees.
+You are responsible for complying with those terms and any associated
+costs.
+
+We are not responsible for changes, outages, or pricing of third-party
+services.
+
+───────────────────────────────────────────────────────────────────
+  6. WARRANTY DISCLAIMER
+───────────────────────────────────────────────────────────────────
+
+THE PRODUCT IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND. We do
+not guarantee uninterrupted operation, error-free performance, or
+specific business outcomes. Your use is at your own risk.
+
+───────────────────────────────────────────────────────────────────
+  7. LIMITATION OF LIABILITY
+───────────────────────────────────────────────────────────────────
+
+In no event shall Build With AI be liable for any indirect, incidental,
+special, consequential, or punitive damages arising from your use of
+the Product. Our total liability is limited to the amount you paid for
+the Product.
+
+───────────────────────────────────────────────────────────────────
+  8. TERMINATION
+───────────────────────────────────────────────────────────────────
+
+This License terminates automatically if you violate any of these
+terms. Upon termination, you must:
+
+  ✓ Stop using the Product
+  ✓ Delete all copies of the Product from your devices
+  ✓ Stop using any license keys issued to you
+
+Termination does not entitle you to a refund unless within the original
+refund window.
+
+───────────────────────────────────────────────────────────────────
+  9. REFUND POLICY
+───────────────────────────────────────────────────────────────────
+
+We offer a 14-day refund window from date of purchase. To request a
+refund, email us at the support address below. After 14 days, all sales
+are final.
+
+───────────────────────────────────────────────────────────────────
+  10. PIRACY NOTICE
+───────────────────────────────────────────────────────────────────
+
+We monitor for unauthorized distribution of our Products. If your
+license key, watermarked download, or source code is found being
+shared, redistributed, or sold by anyone other than Build With AI:
+
+  ✓ Your license will be revoked without refund
+  ✓ Your future updates and support will be discontinued
+  ✓ We reserve the right to pursue legal remedies
+
+We treat piracy seriously. If you've been pirated to (received the
+Product from someone other than us), purchase your own legitimate copy
+to get full access, updates, and support.
+
+───────────────────────────────────────────────────────────────────
+  11. CONTACT
+───────────────────────────────────────────────────────────────────
+
+Build With AI
+Support: support@buildwithai.com (replace with your actual email)
+Store: https://selar.com/m/buildwithai
+
+═══════════════════════════════════════════════════════════════════
+  By using this Product, you acknowledge that you have read,
+  understood, and agreed to these terms.
+
+  Last updated: 2026
+═══════════════════════════════════════════════════════════════════
